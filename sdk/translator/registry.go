@@ -44,7 +44,7 @@ func (r *Registry) Register(from, to Format, request RequestTransform, response 
 // TranslateRequest converts a payload between schemas, returning the original payload
 // if no translator is registered. When falling back to the original payload, the
 // "model" field is still updated to match the resolved model name so that
-// client-side prefixes are not leaked upstream.
+// client-side prefixes (e.g. "copilot/gpt-5-mini") are not leaked upstream.
 func (r *Registry) TranslateRequest(from, to Format, model string, rawJSON []byte, stream bool) []byte {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
