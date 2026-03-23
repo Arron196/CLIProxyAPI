@@ -61,6 +61,27 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 		keepAliveC = keepAlive.C
 	}
 
+	const (
+		flushByteThreshold = 8 * 1024
+		flushTimeThreshold = 25 * time.Millisecond
+	)
+
+	pendingBytes := 0
+	lastFlush := time.Now()
+	flushPending := func(force bool) {
+		if flusher == nil {
+			return
+		}
+		if !force {
+			if pendingBytes < flushByteThreshold && time.Since(lastFlush) < flushTimeThreshold {
+				return
+			}
+		}
+		flusher.Flush()
+		pendingBytes = 0
+		lastFlush = time.Now()
+	}
+
 	var terminalErr *interfaces.ErrorMessage
 	for {
 		select {
@@ -83,19 +104,20 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 					if opts.WriteTerminalError != nil {
 						opts.WriteTerminalError(terminalErr)
 					}
-					flusher.Flush()
+					flushPending(true)
 					cancel(terminalErr.Error)
 					return
 				}
 				if opts.WriteDone != nil {
 					opts.WriteDone()
 				}
-				flusher.Flush()
+				flushPending(true)
 				cancel(nil)
 				return
 			}
 			writeChunk(chunk)
-			flusher.Flush()
+			pendingBytes += len(chunk)
+			flushPending(false)
 		case errMsg, ok := <-errs:
 			if !ok {
 				continue
@@ -104,9 +126,9 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 				terminalErr = errMsg
 				if opts.WriteTerminalError != nil {
 					opts.WriteTerminalError(errMsg)
-					flusher.Flush()
 				}
 			}
+			flushPending(true)
 			var execErr error
 			if errMsg != nil {
 				execErr = errMsg.Error
@@ -115,7 +137,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 			return
 		case <-keepAliveC:
 			writeKeepAlive()
-			flusher.Flush()
+			flushPending(true)
 		}
 	}
 }
