@@ -117,7 +117,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
+	httpReq, err := e.cacheHelper(ctx, from, url, req, body, true)
 	if err != nil {
 		return resp, err
 	}
@@ -216,14 +216,10 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body, _ = sjson.DeleteBytes(body, "stream")
-	if !gjson.GetBytes(body, "instructions").Exists() {
-		body, _ = sjson.SetBytes(body, "instructions", "")
-	}
+	body = normalizeCodexCompactRequestBody(body, baseModel)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
+	httpReq, err := e.cacheHelper(ctx, from, url, req, body, false)
 	if err != nil {
 		return resp, err
 	}
@@ -317,7 +313,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
+	httpReq, err := e.cacheHelper(ctx, from, url, req, body, true)
 	if err != nil {
 		return nil, err
 	}
@@ -596,7 +592,32 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	return auth, nil
 }
 
-func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, rawJSON []byte) (*http.Request, error) {
+func normalizeCodexCompactRequestBody(body []byte, baseModel string) []byte {
+	if len(body) == 0 {
+		return body
+	}
+
+	normalizedSource := sdktranslator.TranslateRequest(sdktranslator.FromString("openai-response"), sdktranslator.FromString("codex"), baseModel, body, false)
+	if !gjson.ValidBytes(normalizedSource) {
+		normalizedSource = body
+	}
+
+	normalized := []byte(`{}`)
+	normalized, _ = sjson.SetBytes(normalized, "model", baseModel)
+	for _, field := range []string{"input", "instructions", "previous_response_id"} {
+		value := gjson.GetBytes(normalizedSource, field)
+		if !value.Exists() {
+			continue
+		}
+		normalized, _ = sjson.SetRawBytes(normalized, field, []byte(value.Raw))
+	}
+	if !gjson.GetBytes(normalized, "instructions").Exists() {
+		normalized, _ = sjson.SetBytes(normalized, "instructions", "")
+	}
+	return normalized
+}
+
+func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, rawJSON []byte, includePromptCacheKey bool) (*http.Request, error) {
 	var cache codexCache
 	if from == "claude" {
 		userIDResult := gjson.GetBytes(req.Payload, "metadata.user_id")
@@ -622,7 +643,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		}
 	}
 
-	if cache.ID != "" {
+	if includePromptCacheKey && cache.ID != "" {
 		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))

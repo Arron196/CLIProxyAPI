@@ -23,6 +23,8 @@ type codexCapturedRequest struct {
 	Path          string
 	Accept        string
 	Authorization string
+	Originator    string
+	AccountID     string
 	Version       string
 	SessionID     string
 	Body          []byte
@@ -143,6 +145,8 @@ func TestCodexExecutorExecuteCompact_LocalServer_RequestShapeAndPayload(t *testi
 			Path:          r.URL.Path,
 			Accept:        r.Header.Get("Accept"),
 			Authorization: r.Header.Get("Authorization"),
+			Originator:    r.Header.Get("Originator"),
+			AccountID:     r.Header.Get("Chatgpt-Account-Id"),
 			Body:          body,
 		}
 
@@ -181,6 +185,107 @@ func TestCodexExecutorExecuteCompact_LocalServer_RequestShapeAndPayload(t *testi
 		t.Fatalf("request instructions = %s, want empty string", gotInstructions.Raw)
 	}
 	if string(resp.Payload) != `{"id":"resp_compact","object":"response","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}` {
+		t.Fatalf("payload = %s", string(resp.Payload))
+	}
+}
+
+func TestCodexExecutorExecuteCompact_LocalServer_AuthBackedNormalizesRequest(t *testing.T) {
+	t.Parallel()
+
+	var captured codexCapturedRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		captured = codexCapturedRequest{
+			Path:          r.URL.Path,
+			Accept:        r.Header.Get("Accept"),
+			Authorization: r.Header.Get("Authorization"),
+			Originator:    r.Header.Get("Originator"),
+			AccountID:     r.Header.Get("Chatgpt-Account-Id"),
+			SessionID:     r.Header.Get("Session_id"),
+			Body:          body,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_compact_oauth","object":"response","status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}`)
+	}))
+	defer server.Close()
+
+	req := cliproxyexecutor.Request{
+		Model: "gpt-5.4",
+		Payload: []byte(`{
+			"model":"gpt-5.4",
+			"instructions":"keep only compact fields",
+			"input":[
+				{"type":"message","role":"system","content":[{"type":"input_text","text":"be precise"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"compact me"}]}
+			],
+			"store":true,
+			"stream":true,
+			"temperature":0.3,
+			"top_p":0.7,
+			"functions":[{"name":"lookup_issue","parameters":{"type":"object"}}],
+			"function_call":{"name":"lookup_issue"},
+			"context_management":[{"type":"compaction","compact_threshold":12000}],
+			"previous_response_id":"resp_prev_123",
+			"prompt_cache_key":"compact-seed",
+			"user":"integration-test"
+		}`),
+	}
+
+	executor := NewCodexExecutor(&config.Config{})
+	resp, err := executor.Execute(
+		context.Background(),
+		newCodexOAuthTestAuth(server.URL, "oauth-token", "chatgpt-acc"),
+		req,
+		cliproxyexecutor.Options{
+			SourceFormat:    sdktranslator.FromString("openai-response"),
+			Alt:             "responses/compact",
+			OriginalRequest: req.Payload,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Execute() compact oauth error = %v", err)
+	}
+
+	if captured.Path != "/responses/compact" {
+		t.Fatalf("path = %q, want %q", captured.Path, "/responses/compact")
+	}
+	if captured.Accept != "application/json" {
+		t.Fatalf("Accept = %q, want %q", captured.Accept, "application/json")
+	}
+	if captured.Authorization != "Bearer oauth-token" {
+		t.Fatalf("Authorization = %q, want %q", captured.Authorization, "Bearer oauth-token")
+	}
+	if captured.Originator != "codex_cli_rs" {
+		t.Fatalf("Originator = %q, want %q", captured.Originator, "codex_cli_rs")
+	}
+	if captured.AccountID != "chatgpt-acc" {
+		t.Fatalf("Chatgpt-Account-Id = %q, want %q", captured.AccountID, "chatgpt-acc")
+	}
+	if captured.SessionID != "compact-seed" {
+		t.Fatalf("Session_id = %q, want %q", captured.SessionID, "compact-seed")
+	}
+	if gotModel := gjson.GetBytes(captured.Body, "model").String(); gotModel != "gpt-5.4" {
+		t.Fatalf("request model = %q, want %q", gotModel, "gpt-5.4")
+	}
+	if gotRole := gjson.GetBytes(captured.Body, "input.0.role").String(); gotRole != "developer" {
+		t.Fatalf("request input[0].role = %q, want %q", gotRole, "developer")
+	}
+	if gotText := gjson.GetBytes(captured.Body, "input.1.content.0.text").String(); gotText != "compact me" {
+		t.Fatalf("request input[1] text = %q, want %q", gotText, "compact me")
+	}
+	if gotInstructions := gjson.GetBytes(captured.Body, "instructions").String(); gotInstructions != "keep only compact fields" {
+		t.Fatalf("request instructions = %q, want %q", gotInstructions, "keep only compact fields")
+	}
+	if gotPrev := gjson.GetBytes(captured.Body, "previous_response_id").String(); gotPrev != "resp_prev_123" {
+		t.Fatalf("previous_response_id = %q, want %q", gotPrev, "resp_prev_123")
+	}
+	for _, field := range []string{"store", "stream", "temperature", "top_p", "functions", "function_call", "context_management", "prompt_cache_key", "user", "parallel_tool_calls", "include"} {
+		if got := gjson.GetBytes(captured.Body, field); got.Exists() {
+			t.Fatalf("%s should be removed for compact path, got %s", field, got.Raw)
+		}
+	}
+	if string(resp.Payload) != `{"id":"resp_compact_oauth","object":"response","status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}` {
 		t.Fatalf("payload = %s", string(resp.Payload))
 	}
 }
@@ -610,6 +715,19 @@ func newCodexTestAuth(baseURL, apiKey string) *cliproxyauth.Auth {
 		Attributes: map[string]string{
 			"base_url": baseURL,
 			"api_key":  apiKey,
+		},
+	}
+}
+
+func newCodexOAuthTestAuth(baseURL, accessToken, accountID string) *cliproxyauth.Auth {
+	return &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"base_url": baseURL,
+		},
+		Metadata: map[string]any{
+			"email":        "user@example.com",
+			"access_token": accessToken,
+			"account_id":   accountID,
 		},
 	}
 }
