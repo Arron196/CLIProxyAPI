@@ -1,0 +1,56 @@
+{
+  "remote": "upstream",
+  "branch": "main",
+  "latest_checked_commit": "9b7d7021af56fe78abe810ec266f47829bd6f7d7",
+  "latest_checked_tag": "v6.9.5",
+  "checked_at": "2026-03-29",
+  "checked_from_local_main_commit": "f2cb22ec564663d55bcba0af03e965318859b412",
+  "review_branch": "codex/upstream-safe-backports-v695",
+  "backported_commits": [
+    {
+      "upstream_commit": "e1e9fc43c17f886ab6b06f95d50ec554e33c824b",
+      "local_commit": "1f196c0a",
+      "subject": "fix: normalize model name in TranslateRequest fallback to prevent prefix leak"
+    },
+    {
+      "upstream_commit": "754f3bcbc32a92f7639837208e33fe8e5247df7c",
+      "local_commit": "c5fabee5",
+      "subject": "fix(codex): strip stream_options from Responses API requests"
+    },
+    {
+      "upstream_commit": "36973d4a6f5debc93e768a00b6741a66fadacf8d",
+      "local_commit": "02e76327",
+      "subject": "Handle Codex capacity errors as retryable"
+    },
+    {
+      "upstream_commit": "c89d19b300140344f2ec6727296a30a672089c45",
+      "local_commit": "1c6507af",
+      "subject": "Preserve default transport settings for proxy clients"
+    },
+    {
+      "upstream_commit": "5c817a9b429b0bf657fb397c5befa3945e8618db",
+      "local_commit": "cae8f1ae",
+      "subject": "fix(auth): prevent stale ModelStates inheritance from disabled auth entries"
+    },
+    {
+      "upstream_commit": "10b824fcac9c8e68100d51e765989647782e656a",
+      "local_commit": "7603b609",
+      "subject": "fix(security): validate auth file names to prevent unsafe input"
+    }
+  ],
+  "confirmed_already_present": [
+    {
+      "upstream_commit": "cccb77b552af59be55df2475115ac4ea2e6a963b",
+      "subject": "fix(auth): avoid blocking oauth callback wait on prompt"
+    },
+    {
+      "upstream_commit": "b2921518ace134117a9b08967a05afba5fdea18d",
+      "subject": "fix: avoid data race when watching request cancellation"
+    },
+    {
+      "upstream_commit": "5331d51f27859b45a5287593160cae9afad9c365",
+      "subject": "fix(auth): ensure absolute paths for auth file handling"
+    }
+  ],
+  "incremental_review_hint": "Use git log --oneline 9b7d7021af56fe78abe810ec266f47829bd6f7d7..upstream/main to review only commits newer than the last audited upstream main commit."
+}
