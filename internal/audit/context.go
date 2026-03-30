@@ -81,7 +81,7 @@ func WithRequest(ctx context.Context, opts coreexecutor.Options, req coreexecuto
 		stream:         opts.Stream,
 		requestedModel: strings.TrimSpace(req.Model),
 		requestHeaders: cloneHeader(opts.Headers),
-		clientRequest:  truncateCopy(opts.OriginalRequest, maxBodyBytes),
+		clientRequest:  compactAndTruncateCopy(opts.OriginalRequest, maxBodyBytes),
 	}
 	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
 		state.requestID = strings.TrimSpace(ginCtx.GetString("REQUEST_ID"))
@@ -129,7 +129,7 @@ func SetClientResponse(ctx context.Context, payload []byte) {
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	state.clientResp = truncateCopy(payload, state.maxBodyBytes)
+	state.clientResp = compactAndTruncateCopy(payload, state.maxBodyBytes)
 }
 
 // AppendClientResponse appends a streaming downstream response chunk.
@@ -204,6 +204,13 @@ func truncateCopy(payload []byte, maxBodyBytes int) []byte {
 		payload = payload[:maxBodyBytes]
 	}
 	return append([]byte(nil), payload...)
+}
+
+func compactAndTruncateCopy(payload []byte, maxBodyBytes int) []byte {
+	if len(payload) == 0 {
+		return nil
+	}
+	return truncateCopy(compactJSONPayload(payload), maxBodyBytes)
 }
 
 func cloneHeader(src http.Header) http.Header {
