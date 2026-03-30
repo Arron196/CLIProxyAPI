@@ -19,6 +19,8 @@ const (
 	SelectedAuthCallbackMetadataKey = "selected_auth_callback"
 	// ExecutionSessionMetadataKey identifies a long-lived downstream execution session.
 	ExecutionSessionMetadataKey = "execution_session_id"
+	// RequestSimHashMetadataKey stores the normalized request SimHash for simhash routing.
+	RequestSimHashMetadataKey = "request_simhash"
 )
 
 // Request encapsulates the translated payload that will be sent to a provider executor.

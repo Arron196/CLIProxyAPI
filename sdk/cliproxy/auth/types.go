@@ -92,6 +92,11 @@ type Auth struct {
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
 
+	// LastRequestSimHash stores the latest routed request SimHash for simhash routing.
+	LastRequestSimHash uint64 `json:"-"`
+	// HasLastRequestSimHash reports whether LastRequestSimHash is initialized.
+	HasLastRequestSimHash bool `json:"-"`
+
 	indexAssigned bool `json:"-"`
 }
 

@@ -145,7 +145,7 @@ quota-exceeded:
 
 # Routing strategy for selecting credentials when multiple match.
 routing:
-  strategy: "round-robin" # round-robin (default), fill-first
+  strategy: "round-robin" # round-robin (default), fill-first, simhash
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: false
