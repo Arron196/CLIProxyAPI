@@ -104,7 +104,7 @@ func (h *Hook) loop() {
 }
 
 func (h *Hook) send(event *Event) error {
-	payload, err := json.Marshal(event)
+	payload, err := json.Marshal(h.prepareEvent(event))
 	if err != nil {
 		return err
 	}
@@ -124,6 +124,16 @@ func (h *Hook) send(event *Event) error {
 		return fmt.Errorf("request audit hook returned status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func (h *Hook) prepareEvent(event *Event) *Event {
+	if event == nil {
+		return nil
+	}
+	prepared := *event
+	prepared.ClientRequest = compactJSONPayload(prepared.ClientRequest)
+	prepared.ClientResponse = compactJSONPayload(prepared.ClientResponse)
+	return &prepared
 }
 
 func newHTTPClient(rawEndpoint string, timeoutSeconds int) (*http.Client, string, error) {

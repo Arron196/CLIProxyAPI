@@ -118,6 +118,9 @@ passthrough-headers: false
 #     - codex
 #   queue-size: 256
 #   timeout-seconds: 5
+#   # JSON request/response bodies are compacted before truncation:
+#   # arrays with more than 6 items keep the first 3 and last 3;
+#   # strings longer than 100 chars keep the first 50 and last 50.
 #   max-body-bytes: 262144
 
 # Number of times to retry a request. Retries will occur if the HTTP response code is 403, 408, 500, 502, 503, or 504.

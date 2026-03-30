@@ -57,7 +57,8 @@ type RequestAuditConfig struct {
 	// TimeoutSeconds is the per-delivery timeout. Default: 5.
 	TimeoutSeconds int `yaml:"timeout-seconds,omitempty" json:"timeout-seconds,omitempty"`
 
-	// MaxBodyBytes truncates request/response bodies captured in audit events. Default: 262144 (256 KiB).
+	// MaxBodyBytes truncates request/response bodies captured in audit events after JSON compaction.
+	// Default: 262144 (256 KiB).
 	MaxBodyBytes int `yaml:"max-body-bytes,omitempty" json:"max-body-bytes,omitempty"`
 }
 
