@@ -84,3 +84,39 @@ func TestPutUsageStatisticsPersistIntervalSeconds_ClampsNegativeValue(t *testing
 		t.Fatalf("persisted config did not clamp value, got:\n%s", string(data))
 	}
 }
+
+func TestPutUsageStatisticsRetentionDays_ClampsNegativeValue(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("usage-statistics-retention-days: 30\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg := &config.Config{UsageStatisticsRetentionDays: 30}
+	h := NewHandler(cfg, configPath, nil)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPut, "/v0/management/config/usage-statistics-retention-days", bytes.NewBufferString(`{"value":-3}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+
+	h.PutUsageStatisticsRetentionDays(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if cfg.UsageStatisticsRetentionDays != 0 {
+		t.Fatalf("cfg.UsageStatisticsRetentionDays = %d, want 0", cfg.UsageStatisticsRetentionDays)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if !strings.Contains(string(data), "usage-statistics-retention-days: 0") {
+		t.Fatalf("persisted config did not clamp value, got:\n%s", string(data))
+	}
+}

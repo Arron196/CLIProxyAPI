@@ -248,6 +248,56 @@ func TestRestoreRequestStatisticsFallsBackToLegacyJSONFile(t *testing.T) {
 	}
 }
 
+func TestRestoreRequestStatisticsAppliesConfiguredRetention(t *testing.T) {
+	previousDays := RetentionDays()
+	SetRetentionDays(0)
+	t.Cleanup(func() {
+		SetRetentionDays(previousDays)
+	})
+
+	now := time.Now()
+	stats := NewRequestStatistics()
+	recordUsageForTest(stats, coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: now.AddDate(0, 0, -40),
+		Detail:      coreusage.Detail{TotalTokens: 1},
+	})
+	recordUsageForTest(stats, coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: now.AddDate(0, 0, -5),
+		Detail:      coreusage.Detail{TotalTokens: 2},
+	})
+
+	path := filepath.Join(t.TempDir(), StatisticsFileName)
+	if err := SaveSnapshotFile(path, stats.Snapshot()); err != nil {
+		t.Fatalf("SaveSnapshotFile() error = %v", err)
+	}
+
+	SetRetentionDays(30)
+	restored := NewRequestStatistics()
+	loaded, _, err := RestoreRequestStatistics(path, restored)
+	if err != nil {
+		t.Fatalf("RestoreRequestStatistics() error = %v", err)
+	}
+	if !loaded {
+		t.Fatalf("RestoreRequestStatistics() loaded = false, want true")
+	}
+
+	snapshot := restored.Snapshot()
+	if snapshot.TotalRequests != 1 {
+		t.Fatalf("snapshot.TotalRequests = %d, want 1", snapshot.TotalRequests)
+	}
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if !restored.HasPendingPersistence() {
+		t.Fatalf("restored stats should remain dirty after retention trims loaded snapshot")
+	}
+}
+
 func recordUsageForTest(stats *RequestStatistics, record coreusage.Record) {
 	stats.Record(context.Background(), record)
 }

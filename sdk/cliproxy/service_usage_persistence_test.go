@@ -42,7 +42,7 @@ func TestServiceApplyUsagePersistenceConfigChangePersistsOnDisable(t *testing.T)
 	service.cfg = newCfg
 	service.cfgMu.Unlock()
 
-	service.applyUsagePersistenceConfigChange(true, 30*time.Second, newCfg)
+	service.applyUsagePersistenceConfigChange(true, 30*time.Second, 0, newCfg)
 
 	path := service.usageStatisticsFilePath()
 	if _, err := os.Stat(path); err != nil {
@@ -72,11 +72,71 @@ func TestServiceApplyUsagePersistenceConfigChangeRestartsLoopOnIntervalChange(t 
 	service.cfg = newCfg
 	service.cfgMu.Unlock()
 
-	service.applyUsagePersistenceConfigChange(true, 3*time.Second, newCfg)
+	service.applyUsagePersistenceConfigChange(true, 3*time.Second, 0, newCfg)
 
 	waitForFile(t, service.usageStatisticsFilePath(), 2200*time.Millisecond)
 	if stats.HasPendingPersistence() {
 		t.Fatalf("stats should be clean after restarted persistence loop flushes")
+	}
+}
+
+func TestServiceApplyUsagePersistenceConfigChangeAppliesRetentionWindow(t *testing.T) {
+	stats := internalusage.NewRequestStatistics()
+	recordUsageForServiceTest(t, stats, time.Now().AddDate(0, 0, -40))
+	recordUsageForServiceTest(t, stats, time.Now().AddDate(0, 0, -1))
+
+	service := newUsagePersistenceTestService(t, stats, true, 30)
+	newCfg := &sdkconfig.Config{
+		UsageStatisticsEnabled:                true,
+		UsageStatisticsPersistIntervalSeconds: 30,
+		UsageStatisticsRetentionDays:          30,
+	}
+
+	service.cfgMu.Lock()
+	service.cfg = newCfg
+	service.cfgMu.Unlock()
+
+	service.applyUsagePersistenceConfigChange(true, 30*time.Second, 0, newCfg)
+
+	if got := stats.Snapshot().TotalRequests; got != 1 {
+		t.Fatalf("snapshot.TotalRequests = %d, want 1 after retention change", got)
+	}
+	if _, err := os.Stat(service.usageStatisticsFilePath()); err != nil {
+		t.Fatalf("expected persisted statistics file after retention change: %v", err)
+	}
+}
+
+func TestServiceRestoreUsageStatisticsPersistsTrimmedSnapshot(t *testing.T) {
+	previousDays := internalusage.RetentionDays()
+	internalusage.SetRetentionDays(0)
+	t.Cleanup(func() {
+		internalusage.SetRetentionDays(previousDays)
+	})
+
+	sourceStats := internalusage.NewRequestStatistics()
+	recordUsageForServiceTest(t, sourceStats, time.Now().AddDate(0, 0, -40))
+	recordUsageForServiceTest(t, sourceStats, time.Now().AddDate(0, 0, -1))
+
+	targetStats := internalusage.NewRequestStatistics()
+	service := newUsagePersistenceTestService(t, targetStats, true, 30)
+	service.cfg.UsageStatisticsRetentionDays = 30
+
+	if err := internalusage.SaveSnapshotFile(service.usageStatisticsFilePath(), sourceStats.Snapshot()); err != nil {
+		t.Fatalf("SaveSnapshotFile() error = %v", err)
+	}
+
+	service.restoreUsageStatistics()
+
+	if got := targetStats.Snapshot().TotalRequests; got != 1 {
+		t.Fatalf("snapshot.TotalRequests = %d, want 1 after restore retention", got)
+	}
+
+	snapshot, err := internalusage.LoadSnapshotFile(service.usageStatisticsFilePath())
+	if err != nil {
+		t.Fatalf("LoadSnapshotFile() error = %v", err)
+	}
+	if snapshot.TotalRequests != 1 {
+		t.Fatalf("persisted snapshot.TotalRequests = %d, want 1 after restore retention", snapshot.TotalRequests)
 	}
 }
 
@@ -85,11 +145,17 @@ func newUsagePersistenceTestService(t *testing.T, stats *internalusage.RequestSt
 
 	baseDir := t.TempDir()
 	t.Setenv("WRITABLE_PATH", baseDir)
+	previousRetention := internalusage.RetentionDays()
+	internalusage.SetRetentionDays(0)
+	t.Cleanup(func() {
+		internalusage.SetRetentionDays(previousRetention)
+	})
 
 	return &Service{
 		cfg: &sdkconfig.Config{
 			UsageStatisticsEnabled:                enabled,
 			UsageStatisticsPersistIntervalSeconds: intervalSeconds,
+			UsageStatisticsRetentionDays:          0,
 		},
 		usageStats: stats,
 	}

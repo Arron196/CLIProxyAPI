@@ -98,6 +98,10 @@ usage-statistics-enabled: false
 # Set to 0 to disable periodic flushes; startup restore and shutdown save still remain available.
 usage-statistics-persist-interval-seconds: 30
 
+# Retain only the most recent N local calendar days in memory and snapshot files.
+# Set to 0 to keep unlimited history.
+usage-statistics-retention-days: 0
+
 # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
 # Per-entry proxy-url also supports "direct" or "none" to bypass both the global proxy-url and environment proxies explicitly.
 proxy-url: ""

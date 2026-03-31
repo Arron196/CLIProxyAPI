@@ -69,6 +69,11 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 	}
 
 	result := h.usageStats.MergeSnapshot(payload.Usage)
+	retentionDays := 0
+	if h.cfg != nil && h.cfg.UsageStatisticsRetentionDays > 0 {
+		retentionDays = h.cfg.UsageStatisticsRetentionDays
+	}
+	h.usageStats.ApplyRetention(time.Now(), retentionDays)
 	snapshot := h.usageStats.Snapshot()
 	c.JSON(http.StatusOK, gin.H{
 		"added":           result.Added,

@@ -213,6 +213,26 @@ func (h *Handler) PutUsageStatisticsPersistIntervalSeconds(c *gin.Context) {
 	h.persist(c)
 }
 
+// UsageStatisticsRetentionDays
+func (h *Handler) GetUsageStatisticsRetentionDays(c *gin.Context) {
+	c.JSON(200, gin.H{"usage-statistics-retention-days": h.cfg.UsageStatisticsRetentionDays})
+}
+func (h *Handler) PutUsageStatisticsRetentionDays(c *gin.Context) {
+	var body struct {
+		Value *int `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	value := *body.Value
+	if value < 0 {
+		value = 0
+	}
+	h.cfg.UsageStatisticsRetentionDays = value
+	h.persist(c)
+}
+
 // LoggingToFile
 func (h *Handler) GetLoggingToFile(c *gin.Context) {
 	c.JSON(200, gin.H{"logging-to-file": h.cfg.LoggingToFile})

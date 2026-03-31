@@ -17,9 +17,11 @@ import (
 )
 
 var statisticsEnabled atomic.Bool
+var statisticsRetentionDays atomic.Int64
 
 func init() {
 	statisticsEnabled.Store(true)
+	statisticsRetentionDays.Store(0)
 	coreusage.RegisterPlugin(NewLoggerPlugin())
 }
 
@@ -57,6 +59,24 @@ func SetStatisticsEnabled(enabled bool) { statisticsEnabled.Store(enabled) }
 // StatisticsEnabled reports the current recording state.
 func StatisticsEnabled() bool { return statisticsEnabled.Load() }
 
+// SetRetentionDays configures the rolling retention window for in-memory usage
+// details and derived aggregates. Values <= 0 disable retention trimming.
+func SetRetentionDays(days int) {
+	if days < 0 {
+		days = 0
+	}
+	statisticsRetentionDays.Store(int64(days))
+}
+
+// RetentionDays reports the currently configured retention window in days.
+func RetentionDays() int {
+	v := statisticsRetentionDays.Load()
+	if v <= 0 {
+		return 0
+	}
+	return int(v)
+}
+
 // RequestStatistics maintains aggregated request metrics in memory.
 type RequestStatistics struct {
 	mu sync.RWMutex
@@ -67,6 +87,7 @@ type RequestStatistics struct {
 	totalTokens    int64
 	changeCount    uint64
 	persistedCount uint64
+	retentionDay   string
 
 	apis map[string]*apiStats
 
@@ -184,9 +205,12 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	}
 	dayKey := timestamp.Format("2006-01-02")
 	hourKey := timestamp.Hour()
+	now := time.Now()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.applyRetentionIfNeededLocked(now)
 
 	s.totalRequests++
 	if success {
@@ -216,6 +240,26 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.tokensByDay[dayKey] += totalTokens
 	s.tokensByHour[hourKey] += totalTokens
 	s.markChangedLocked()
+}
+
+func (s *RequestStatistics) applyRetentionIfNeededLocked(now time.Time) {
+	if s == nil {
+		return
+	}
+	retentionDays := RetentionDays()
+	if retentionDays <= 0 {
+		s.retentionDay = ""
+		return
+	}
+	now = ensureRetentionReferenceTime(now)
+	day := now.In(time.Local).Format("2006-01-02")
+	if s.retentionDay == day {
+		return
+	}
+	if s.applyRetentionLocked(now, retentionDays) {
+		s.markChangedLocked()
+	}
+	s.retentionDay = day
 }
 
 func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) {
@@ -431,8 +475,162 @@ func (s *RequestStatistics) MarkAllPersisted() {
 	s.persistedCount = s.changeCount
 }
 
+// ApplyRetention trims in-memory usage details and derived aggregates to the
+// most recent retentionDays local calendar days. It returns whether any data
+// was removed or normalized.
+func (s *RequestStatistics) ApplyRetention(now time.Time, retentionDays int) bool {
+	if s == nil {
+		return false
+	}
+	if retentionDays < 0 {
+		retentionDays = 0
+	}
+	now = ensureRetentionReferenceTime(now)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if retentionDays == 0 {
+		s.retentionDay = ""
+		return false
+	}
+	changed := s.applyRetentionLocked(now, retentionDays)
+	s.retentionDay = now.In(time.Local).Format("2006-01-02")
+	if changed {
+		s.markChangedLocked()
+	}
+	return changed
+}
+
+func (s *RequestStatistics) applyRetentionLocked(now time.Time, retentionDays int) bool {
+	if s == nil || retentionDays <= 0 {
+		return false
+	}
+	now = ensureRetentionReferenceTime(now)
+	cutoff := retentionCutoffByLocalDate(now, retentionDays)
+
+	newAPIs := make(map[string]*apiStats, len(s.apis))
+	newRequestsByDay := make(map[string]int64, len(s.requestsByDay))
+	newRequestsByHour := make(map[int]int64, len(s.requestsByHour))
+	newTokensByDay := make(map[string]int64, len(s.tokensByDay))
+	newTokensByHour := make(map[int]int64, len(s.tokensByHour))
+
+	var (
+		totalRequests int64
+		successCount  int64
+		failureCount  int64
+		totalTokens   int64
+		originDetails int64
+		keptDetails   int64
+		normalized    bool
+	)
+
+	for apiName, stats := range s.apis {
+		if stats == nil || len(stats.Models) == 0 {
+			continue
+		}
+		dstAPI := &apiStats{Models: make(map[string]*modelStats, len(stats.Models))}
+		for modelName, modelStatsValue := range stats.Models {
+			if modelStatsValue == nil {
+				continue
+			}
+			dstModel := &modelStats{}
+			for _, detail := range modelStatsValue.Details {
+				originDetails++
+				ts := detail.Timestamp
+				if ts.IsZero() {
+					ts = now
+					detail.Timestamp = ts
+					normalized = true
+				}
+				if ts.Before(cutoff) {
+					continue
+				}
+
+				tokens := normaliseTokenStats(detail.Tokens)
+				detail.Tokens = tokens
+				modelTokens := tokens.TotalTokens
+				if modelTokens < 0 {
+					modelTokens = 0
+					detail.Tokens.TotalTokens = 0
+				}
+				if detail.LatencyMs < 0 {
+					detail.LatencyMs = 0
+					normalized = true
+				}
+
+				dstModel.Details = append(dstModel.Details, detail)
+				dstModel.TotalRequests++
+				dstModel.TotalTokens += modelTokens
+
+				dstAPI.TotalRequests++
+				dstAPI.TotalTokens += modelTokens
+
+				totalRequests++
+				if detail.Failed {
+					failureCount++
+				} else {
+					successCount++
+				}
+				totalTokens += modelTokens
+
+				dayKey := ts.Format("2006-01-02")
+				hourKey := ts.Hour()
+				newRequestsByDay[dayKey]++
+				newRequestsByHour[hourKey]++
+				newTokensByDay[dayKey] += modelTokens
+				newTokensByHour[hourKey] += modelTokens
+
+				keptDetails++
+			}
+			if dstModel.TotalRequests == 0 {
+				continue
+			}
+			dstAPI.Models[modelName] = dstModel
+		}
+		if dstAPI.TotalRequests == 0 {
+			continue
+		}
+		newAPIs[apiName] = dstAPI
+	}
+
+	changed := normalized || keptDetails != originDetails
+	if !changed {
+		return false
+	}
+
+	s.apis = newAPIs
+	s.totalRequests = totalRequests
+	s.successCount = successCount
+	s.failureCount = failureCount
+	s.totalTokens = totalTokens
+	s.requestsByDay = newRequestsByDay
+	s.requestsByHour = newRequestsByHour
+	s.tokensByDay = newTokensByDay
+	s.tokensByHour = newTokensByHour
+	return true
+}
+
 func (s *RequestStatistics) markChangedLocked() {
 	s.changeCount++
+}
+
+func retentionCutoffByLocalDate(now time.Time, retentionDays int) time.Time {
+	now = ensureRetentionReferenceTime(now)
+	if retentionDays <= 0 {
+		return time.Time{}
+	}
+	loc := time.Local
+	localNow := now.In(loc)
+	startToday := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, loc)
+	return startToday.AddDate(0, 0, -(retentionDays - 1))
+}
+
+func ensureRetentionReferenceTime(now time.Time) time.Time {
+	if now.IsZero() {
+		return time.Now()
+	}
+	return now
 }
 
 func dedupKey(apiName, modelName string, detail RequestDetail) string {

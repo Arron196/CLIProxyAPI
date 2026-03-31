@@ -117,6 +117,67 @@ func TestExportImportUsageStatistics_PreservesClientIP(t *testing.T) {
 	}
 }
 
+func TestImportUsageStatistics_AppliesRetentionDays(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	targetStats := internalusage.NewRequestStatistics()
+	handler := NewHandlerWithoutConfigFilePath(&config.Config{
+		UsageStatisticsRetentionDays: 30,
+	}, nil)
+	handler.SetUsageStatistics(targetStats)
+
+	now := time.Now()
+	payload := usageImportPayload{
+		Version: 1,
+		Usage: internalusage.StatisticsSnapshot{
+			APIs: map[string]internalusage.APISnapshot{
+				"test-key": {
+					Models: map[string]internalusage.ModelSnapshot{
+						"gpt-5.4": {
+							Details: []internalusage.RequestDetail{
+								{
+									Timestamp: now.AddDate(0, 0, -40),
+									Tokens:    internalusage.TokenStats{TotalTokens: 1},
+								},
+								{
+									Timestamp: now.AddDate(0, 0, -2),
+									Tokens:    internalusage.TokenStats{TotalTokens: 2},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	body, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		t.Fatalf("marshal payload: %v", errMarshal)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/usage/import", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+
+	handler.ImportUsageStatistics(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	snapshot := targetStats.Snapshot()
+	if snapshot.TotalRequests != 1 {
+		t.Fatalf("snapshot.TotalRequests = %d, want 1", snapshot.TotalRequests)
+	}
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+}
+
 func recordManagementUsageWithRemoteAddr(t *testing.T, stats *internalusage.RequestStatistics, remoteAddr string, record coreusage.Record) {
 	t.Helper()
 

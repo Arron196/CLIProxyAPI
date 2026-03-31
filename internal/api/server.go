@@ -518,6 +518,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/usage-statistics-persist-interval-seconds", s.mgmt.PutUsageStatisticsPersistIntervalSeconds)
 		mgmt.PATCH("/usage-statistics-persist-interval-seconds", s.mgmt.PutUsageStatisticsPersistIntervalSeconds)
 
+		mgmt.GET("/usage-statistics-retention-days", s.mgmt.GetUsageStatisticsRetentionDays)
+		mgmt.PUT("/usage-statistics-retention-days", s.mgmt.PutUsageStatisticsRetentionDays)
+		mgmt.PATCH("/usage-statistics-retention-days", s.mgmt.PutUsageStatisticsRetentionDays)
+
 		mgmt.GET("/proxy-url", s.mgmt.GetProxyURL)
 		mgmt.PUT("/proxy-url", s.mgmt.PutProxyURL)
 		mgmt.PATCH("/proxy-url", s.mgmt.PutProxyURL)
@@ -909,6 +913,9 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 
 	if oldCfg == nil || oldCfg.UsageStatisticsEnabled != cfg.UsageStatisticsEnabled {
 		usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
+	}
+	if oldCfg == nil || oldCfg.UsageStatisticsRetentionDays != cfg.UsageStatisticsRetentionDays {
+		usage.SetRetentionDays(cfg.UsageStatisticsRetentionDays)
 	}
 
 	if s.requestLogger != nil && (oldCfg == nil || oldCfg.ErrorLogsMaxFiles != cfg.ErrorLogsMaxFiles) {

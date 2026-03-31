@@ -342,6 +342,7 @@ func (m configTabModel) parseConfig(cfg map[string]any) []configField {
 	fields = append(fields, configField{"Error Logs Max Files", "error-logs-max-files", "int", fmt.Sprintf("%.0f", getFloat(cfg, "error-logs-max-files")), nil})
 	fields = append(fields, configField{"Usage Stats Enabled", "usage-statistics-enabled", "bool", fmt.Sprintf("%v", getBool(cfg, "usage-statistics-enabled")), nil})
 	fields = append(fields, configField{"Usage Stats Persist Interval (s)", "usage-statistics-persist-interval-seconds", "int", fmt.Sprintf("%.0f", getFloat(cfg, "usage-statistics-persist-interval-seconds")), nil})
+	fields = append(fields, configField{"Usage Stats Retention (days)", "usage-statistics-retention-days", "int", fmt.Sprintf("%.0f", getFloat(cfg, "usage-statistics-retention-days")), nil})
 	fields = append(fields, configField{"Request Log", "request-log", "bool", fmt.Sprintf("%v", getBool(cfg, "request-log")), nil})
 
 	// Quota exceeded
@@ -383,7 +384,7 @@ func fieldSection(apiPath string) string {
 	switch apiPath {
 	case "port", "host", "debug", "proxy-url", "request-retry", "max-invalid-request-retries", "max-retry-interval", "force-model-prefix":
 		return T("section_server")
-	case "logging-to-file", "logs-max-total-size-mb", "error-logs-max-files", "usage-statistics-enabled", "usage-statistics-persist-interval-seconds", "request-log":
+	case "logging-to-file", "logs-max-total-size-mb", "error-logs-max-files", "usage-statistics-enabled", "usage-statistics-persist-interval-seconds", "usage-statistics-retention-days", "request-log":
 		return T("section_logging")
 	case "ws-auth":
 		return T("section_websocket")

@@ -235,3 +235,99 @@ func TestRequestStatisticsMergeSnapshotKeepsDistinctClientIPs(t *testing.T) {
 		t.Fatalf("details client_ip set = %#v, want both client IPs preserved", seenIPs)
 	}
 }
+
+func TestRequestStatisticsApplyRetentionByLocalDate(t *testing.T) {
+	stats := NewRequestStatistics()
+	records := []coreusage.Record{
+		{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			RequestedAt: time.Date(2026, 3, 1, 23, 59, 59, 0, time.Local),
+			Detail:      coreusage.Detail{TotalTokens: 1},
+		},
+		{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			RequestedAt: time.Date(2026, 3, 2, 0, 0, 0, 0, time.Local),
+			Detail:      coreusage.Detail{TotalTokens: 2},
+		},
+		{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			RequestedAt: time.Date(2026, 3, 31, 12, 0, 0, 0, time.Local),
+			Failed:      true,
+			Detail:      coreusage.Detail{TotalTokens: 3},
+		},
+	}
+	for _, record := range records {
+		stats.Record(context.Background(), record)
+	}
+
+	changed := stats.ApplyRetention(time.Date(2026, 3, 31, 16, 0, 0, 0, time.Local), 30)
+	if !changed {
+		t.Fatalf("ApplyRetention() changed = false, want true")
+	}
+
+	snapshot := stats.Snapshot()
+	if snapshot.TotalRequests != 2 {
+		t.Fatalf("snapshot.TotalRequests = %d, want 2", snapshot.TotalRequests)
+	}
+	if snapshot.SuccessCount != 1 {
+		t.Fatalf("snapshot.SuccessCount = %d, want 1", snapshot.SuccessCount)
+	}
+	if snapshot.FailureCount != 1 {
+		t.Fatalf("snapshot.FailureCount = %d, want 1", snapshot.FailureCount)
+	}
+	if snapshot.TotalTokens != 5 {
+		t.Fatalf("snapshot.TotalTokens = %d, want 5", snapshot.TotalTokens)
+	}
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 2 {
+		t.Fatalf("details len = %d, want 2", len(details))
+	}
+	if details[0].Timestamp.Before(time.Date(2026, 3, 2, 0, 0, 0, 0, time.Local)) {
+		t.Fatalf("first detail timestamp = %s, want >= 2026-03-02 00:00:00 local", details[0].Timestamp)
+	}
+	if _, ok := snapshot.RequestsByDay["2026-03-01"]; ok {
+		t.Fatalf("requests_by_day should not contain 2026-03-01 after retention")
+	}
+	if _, ok := snapshot.TokensByDay["2026-03-01"]; ok {
+		t.Fatalf("tokens_by_day should not contain 2026-03-01 after retention")
+	}
+}
+
+func TestRequestStatisticsRecordAppliesRetentionOnDayChange(t *testing.T) {
+	previousDays := RetentionDays()
+	SetRetentionDays(1)
+	t.Cleanup(func() {
+		SetRetentionDays(previousDays)
+	})
+
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
+		Detail:      coreusage.Detail{TotalTokens: 1},
+	})
+
+	if changed := stats.ApplyRetention(time.Date(2026, 3, 21, 1, 0, 0, 0, time.Local), 1); !changed {
+		t.Fatalf("ApplyRetention() changed = false, want true for old records")
+	}
+
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Now(),
+		Detail:      coreusage.Detail{TotalTokens: 2},
+	})
+
+	snapshot := stats.Snapshot()
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if snapshot.TotalTokens != 2 {
+		t.Fatalf("snapshot.TotalTokens = %d, want 2", snapshot.TotalTokens)
+	}
+}

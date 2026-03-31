@@ -273,6 +273,10 @@ func (s *Service) restoreUsageStatistics() {
 	if s == nil || !s.usageStatisticsEnabled() {
 		return
 	}
+	cfg := s.currentConfig()
+	if cfg != nil {
+		internalusage.SetRetentionDays(cfg.UsageStatisticsRetentionDays)
+	}
 	path := s.usageStatisticsFilePath()
 	if strings.TrimSpace(path) == "" {
 		return
@@ -284,12 +288,19 @@ func (s *Service) restoreUsageStatistics() {
 	}
 	if loaded {
 		log.Infof("usage statistics restored from %s (added=%d skipped=%d)", path, result.Added, result.Skipped)
+		if stats := s.usageStatisticsStore(); stats != nil && stats.HasPendingPersistence() {
+			s.persistUsageStatistics("restore")
+		}
 	}
 }
 
 func (s *Service) persistUsageStatistics(reason string) {
 	if s == nil {
 		return
+	}
+	cfg := s.currentConfig()
+	if cfg != nil {
+		internalusage.SetRetentionDays(cfg.UsageStatisticsRetentionDays)
 	}
 	path := s.usageStatisticsFilePath()
 	if strings.TrimSpace(path) == "" {
@@ -370,19 +381,28 @@ func (s *Service) restartUsagePersistenceLoop() {
 	s.startUsagePersistenceLoop()
 }
 
-func (s *Service) applyUsagePersistenceConfigChange(previousEnabled bool, previousInterval time.Duration, newCfg *config.Config) {
+func (s *Service) applyUsagePersistenceConfigChange(previousEnabled bool, previousInterval time.Duration, previousRetentionDays int, newCfg *config.Config) {
 	if s == nil || newCfg == nil {
 		return
 	}
+	internalusage.SetRetentionDays(newCfg.UsageStatisticsRetentionDays)
 
 	currentEnabled := newCfg.UsageStatisticsEnabled
 	currentInterval := usagePersistenceIntervalForConfig(newCfg)
+	currentRetentionDays := newCfg.UsageStatisticsRetentionDays
 
 	if previousEnabled && !currentEnabled {
 		s.persistUsageStatistics("disable")
 	}
 	if !previousEnabled && currentEnabled {
 		s.restoreUsageStatistics()
+	}
+	if currentEnabled && previousRetentionDays != currentRetentionDays {
+		if stats := s.usageStatisticsStore(); stats != nil {
+			if stats.ApplyRetention(time.Now(), currentRetentionDays) {
+				s.persistUsageStatistics("retention-change")
+			}
+		}
 	}
 	if previousEnabled != currentEnabled || previousInterval != currentInterval {
 		s.restartUsagePersistenceLoop()
@@ -1689,6 +1709,10 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.ensureAuthDir(); err != nil {
 		return err
 	}
+	if s.cfg != nil {
+		internalusage.SetStatisticsEnabled(s.cfg.UsageStatisticsEnabled)
+		internalusage.SetRetentionDays(s.cfg.UsageStatisticsRetentionDays)
+	}
 	s.restoreUsageStatistics()
 
 	s.applyRetryConfig(s.cfg)
@@ -1810,11 +1834,13 @@ func (s *Service) Run(ctx context.Context) error {
 		previousStrategy := ""
 		previousUsageEnabled := false
 		previousUsagePersistenceInterval := time.Duration(0)
+		previousUsageRetentionDays := 0
 		s.cfgMu.RLock()
 		if s.cfg != nil {
 			previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
 			previousUsageEnabled = s.cfg.UsageStatisticsEnabled
 			previousUsagePersistenceInterval = usagePersistenceIntervalForConfig(s.cfg)
+			previousUsageRetentionDays = s.cfg.UsageStatisticsRetentionDays
 		}
 		s.cfgMu.RUnlock()
 
@@ -1876,7 +1902,7 @@ func (s *Service) Run(ctx context.Context) error {
 			s.coreManager.SetConfig(newCfg)
 			s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
 		}
-		s.applyUsagePersistenceConfigChange(previousUsageEnabled, previousUsagePersistenceInterval, newCfg)
+		s.applyUsagePersistenceConfigChange(previousUsageEnabled, previousUsagePersistenceInterval, previousUsageRetentionDays, newCfg)
 		s.rebindExecutors()
 	}
 

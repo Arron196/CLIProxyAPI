@@ -70,6 +70,11 @@ type Config struct {
 	// while still allowing startup restore and shutdown save.
 	UsageStatisticsPersistIntervalSeconds int `yaml:"usage-statistics-persist-interval-seconds" json:"usage-statistics-persist-interval-seconds"`
 
+	// UsageStatisticsRetentionDays controls retention of usage statistics.
+	// When > 0, only records from the most recent N local calendar days are kept
+	// in memory and persisted snapshots.
+	UsageStatisticsRetentionDays int `yaml:"usage-statistics-retention-days" json:"usage-statistics-retention-days"`
+
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
@@ -627,6 +632,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.ErrorLogsMaxFiles = 10
 	cfg.UsageStatisticsEnabled = false
 	cfg.UsageStatisticsPersistIntervalSeconds = 30
+	cfg.UsageStatisticsRetentionDays = 0
 	cfg.DisableCooling = false
 	cfg.AuthMaintenance.ScanIntervalSeconds = 30
 	cfg.AuthMaintenance.DeleteIntervalSeconds = 5
@@ -694,6 +700,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	if cfg.UsageStatisticsPersistIntervalSeconds < 0 {
 		cfg.UsageStatisticsPersistIntervalSeconds = 0
+	}
+	if cfg.UsageStatisticsRetentionDays < 0 {
+		cfg.UsageStatisticsRetentionDays = 0
 	}
 
 	if cfg.MaxRetryCredentials < 0 {
@@ -1426,6 +1435,8 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 			return node.Value == "10"
 		case "usage-statistics-persist-interval-seconds":
 			return node.Value == "30"
+		case "usage-statistics-retention-days":
+			return node.Value == "0"
 		case "routing.success-rate.half-life-seconds":
 			return node.Value == "1800"
 		}

@@ -123,7 +123,8 @@ func RestoreRequestStatistics(path string, stats *RequestStatistics) (loaded boo
 		}
 	}
 	result = stats.MergeSnapshot(snapshot)
-	if versionBefore == persistedBefore {
+	retentionChanged := stats.ApplyRetention(time.Now(), RetentionDays())
+	if versionBefore == persistedBefore && !retentionChanged {
 		stats.MarkAllPersisted()
 	}
 	return true, result, nil
@@ -137,6 +138,7 @@ func PersistRequestStatistics(path string, stats *RequestStatistics) (bool, erro
 	if stats == nil {
 		return false, nil
 	}
+	stats.ApplyRetention(time.Now(), RetentionDays())
 	snapshot, version, persistedVersion := stats.SnapshotWithState()
 	if version == persistedVersion {
 		return false, nil

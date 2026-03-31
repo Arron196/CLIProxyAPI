@@ -225,6 +225,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		LoggingToFile:                         false,
 		UsageStatisticsEnabled:                false,
 		UsageStatisticsPersistIntervalSeconds: 30,
+		UsageStatisticsRetentionDays:          0,
 		DisableCooling:                        false,
 		RequestRetry:                          1,
 		MaxRetryCredentials:                   1,
@@ -250,6 +251,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		LoggingToFile:                         true,
 		UsageStatisticsEnabled:                true,
 		UsageStatisticsPersistIntervalSeconds: 10,
+		UsageStatisticsRetentionDays:          30,
 		DisableCooling:                        true,
 		RequestRetry:                          2,
 		MaxRetryCredentials:                   3,
@@ -289,6 +291,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	expectContains(t, details, "logging-to-file: false -> true")
 	expectContains(t, details, "usage-statistics-enabled: false -> true")
 	expectContains(t, details, "usage-statistics-persist-interval-seconds: 30 -> 10")
+	expectContains(t, details, "usage-statistics-retention-days: 0 -> 30")
 	expectContains(t, details, "disable-cooling: false -> true")
 	expectContains(t, details, "request-log: false -> true")
 	expectContains(t, details, "request-retry: 1 -> 2")
