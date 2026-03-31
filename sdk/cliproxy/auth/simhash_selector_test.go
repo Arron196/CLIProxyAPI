@@ -54,11 +54,11 @@ func TestSimHashSelectorSkipsUnavailableAuths(t *testing.T) {
 	selector := NewSimHashSelector(internalconfig.RoutingSimHashConfig{PoolSize: 2, AdmitCooldownSeconds: 60})
 	auths := []*Auth{
 		{
-			ID:                   "a",
-			Provider:             "codex",
-			Status:               StatusActive,
+			ID:                    "a",
+			Provider:              "codex",
+			Status:                StatusActive,
 			HasLastRequestSimHash: true,
-			LastRequestSimHash:   0,
+			LastRequestSimHash:    0,
 			ModelStates: map[string]*ModelState{
 				"gpt-5.4": {
 					Status:         StatusError,
@@ -68,11 +68,11 @@ func TestSimHashSelectorSkipsUnavailableAuths(t *testing.T) {
 			},
 		},
 		{
-			ID:                   "b",
-			Provider:             "codex",
-			Status:               StatusActive,
+			ID:                    "b",
+			Provider:              "codex",
+			Status:                StatusActive,
 			HasLastRequestSimHash: true,
-			LastRequestSimHash:   7,
+			LastRequestSimHash:    7,
 		},
 	}
 	opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.RequestSimHashMetadataKey: uint64(0)}}
@@ -138,8 +138,14 @@ func TestSimHashSelectorPoolOnlyAdmitsOneNewAuthAfterFilled(t *testing.T) {
 		{ID: "d", Provider: "codex", Status: StatusActive},
 	}
 	selected, err = selector.Pick(context.Background(), "codex", "gpt-5.4", cliproxyexecutor.Options{}, blockedAuths)
-	if err == nil {
-		t.Fatalf("expected pool admission cooldown to block outsider admission, got %v", selected)
+	if err != nil {
+		t.Fatalf("pick error = %v, want existing pool member c to continue serving", err)
+	}
+	if selected == nil || selected.ID != "c" {
+		t.Fatalf("selected = %#v, want existing pool member c", selected)
+	}
+	if _, ok := selector.pool.members["d"]; ok {
+		t.Fatalf("expected outsider d to stay out of pool during cooldown, pool=%v", selector.pool.members)
 	}
 }
 
