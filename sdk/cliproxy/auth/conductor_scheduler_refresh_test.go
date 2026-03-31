@@ -161,3 +161,37 @@ func TestManager_PickNext_RebuildsSchedulerAfterModelCooldownError(t *testing.T)
 		t.Fatalf("pickNext() auth = %v, want %q", got, newAuth.ID)
 	}
 }
+
+func TestManager_PickNextMixed_DoesNotDropRequestedModelWhenRegistryMappingIsMissing(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "codex"})
+
+	auth := &Auth{
+		ID:       "codex-registry-restricted",
+		Provider: "codex",
+	}
+	if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	registerSchedulerModels(t, "codex", "gpt-5.2", auth.ID)
+
+	got, executor, provider, errPick := manager.pickNextMixed(ctx, []string{"codex"}, "gpt-5.4", cliproxyexecutor.Options{}, nil)
+	var authErr *Error
+	if !errors.As(errPick, &authErr) || authErr == nil {
+		t.Fatalf("pickNextMixed() error = %v, want auth_not_found", errPick)
+	}
+	if authErr.Code != "auth_not_found" {
+		t.Fatalf("pickNextMixed() code = %q, want %q", authErr.Code, "auth_not_found")
+	}
+	if got != nil {
+		t.Fatalf("pickNextMixed() auth = %v, want nil", got)
+	}
+	if executor != nil {
+		t.Fatalf("pickNextMixed() executor = %v, want nil", executor)
+	}
+	if provider != "" {
+		t.Fatalf("pickNextMixed() provider = %q, want empty", provider)
+	}
+}
