@@ -3,7 +3,9 @@ package auth
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"math/bits"
+	"strconv"
 	"sync"
 	"time"
 
@@ -14,12 +16,14 @@ import (
 const (
 	defaultSimHashPoolSize            = 10
 	defaultSimHashAdmitCooldownSecond = 1
+	simHashAdmissionEpoch             = 10 * time.Minute
 )
 
 type simHashPoolState struct {
-	members        map[string]struct{}
-	everFilled     bool
-	lastAdmittedAt time.Time
+	members             map[string]struct{}
+	everFilled          bool
+	lastAdmittedAt      time.Time
+	preferredOutsiderID string
 }
 
 // SimHashSelector routes requests to the nearest available auth by request SimHash.
@@ -74,9 +78,12 @@ func (s *SimHashSelector) Pick(ctx context.Context, provider, model string, opts
 	poolMembers, outsiders := s.partitionAvailableLocked(available)
 
 	if len(s.pool.members) < s.effectivePoolSizeLocked() && len(outsiders) > 0 {
-		admitted := s.pickRoundRobinLocked("simhash:admit", outsiders)
+		admitted := s.pickAdmissionCandidateLocked(now, outsiders)
 		if admitted != nil {
 			s.pool.members[admitted.ID] = struct{}{}
+			if s.pool.preferredOutsiderID == admitted.ID {
+				s.pool.preferredOutsiderID = ""
+			}
 			s.pool.lastAdmittedAt = now
 			if len(s.pool.members) >= s.effectivePoolSizeLocked() {
 				s.pool.everFilled = true
@@ -87,9 +94,12 @@ func (s *SimHashSelector) Pick(ctx context.Context, provider, model string, opts
 	}
 
 	if len(poolMembers) == 0 && len(outsiders) > 0 && (!s.pool.everFilled || now.Sub(s.pool.lastAdmittedAt) >= s.admitCooldownLocked()) {
-		admitted := s.pickRoundRobinLocked("simhash:admit", outsiders)
+		admitted := s.pickAdmissionCandidateLocked(now, outsiders)
 		if admitted != nil {
 			s.pool.members[admitted.ID] = struct{}{}
+			if s.pool.preferredOutsiderID == admitted.ID {
+				s.pool.preferredOutsiderID = ""
+			}
 			s.pool.lastAdmittedAt = now
 			s.mu.Unlock()
 			return admitted, nil
@@ -167,6 +177,11 @@ func (s *SimHashSelector) prunePoolLocked(allAuths []*Auth, now time.Time) {
 			delete(s.pool.members, authID)
 		}
 	}
+	if s.pool.preferredOutsiderID != "" {
+		if _, ok := globallyAvailableIDs[s.pool.preferredOutsiderID]; !ok {
+			s.pool.preferredOutsiderID = ""
+		}
+	}
 }
 
 func (s *SimHashSelector) partitionAvailableLocked(available []*Auth) ([]*Auth, []*Auth) {
@@ -183,6 +198,44 @@ func (s *SimHashSelector) partitionAvailableLocked(available []*Auth) ([]*Auth, 
 		}
 	}
 	return members, outsiders
+}
+
+func (s *SimHashSelector) pickAdmissionCandidateLocked(now time.Time, auths []*Auth) *Auth {
+	if len(auths) == 0 {
+		s.pool.preferredOutsiderID = ""
+		return nil
+	}
+	if len(auths) == 1 {
+		s.pool.preferredOutsiderID = auths[0].ID
+		return auths[0]
+	}
+	if preferred := s.findAuthByID(auths, s.pool.preferredOutsiderID); preferred != nil {
+		return preferred
+	}
+	epoch := admissionEpoch(now)
+	best := auths[0]
+	bestScore := admissionOrderScore(epoch, best)
+	for _, candidate := range auths[1:] {
+		score := admissionOrderScore(epoch, candidate)
+		if score < bestScore || (score == bestScore && candidate.ID < best.ID) {
+			best = candidate
+			bestScore = score
+		}
+	}
+	s.pool.preferredOutsiderID = best.ID
+	return best
+}
+
+func (s *SimHashSelector) findAuthByID(auths []*Auth, authID string) *Auth {
+	if authID == "" {
+		return nil
+	}
+	for _, auth := range auths {
+		if auth != nil && auth.ID == authID {
+			return auth
+		}
+	}
+	return nil
 }
 
 func (s *SimHashSelector) pickRoundRobinLocked(key string, auths []*Auth) *Auth {
@@ -208,6 +261,26 @@ func (s *SimHashSelector) pickRoundRobinLocked(key string, auths []*Auth) *Auth 
 	}
 	s.cursors[key] = index + 1
 	return auths[index%len(auths)]
+}
+
+func admissionEpoch(now time.Time) int64 {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return now.UTC().Unix() / int64(simHashAdmissionEpoch/time.Second)
+}
+
+func admissionOrderScore(epoch int64, auth *Auth) uint64 {
+	if auth == nil {
+		return 0
+	}
+	h := fnv.New64a()
+	var buf [24]byte
+	epochBytes := strconv.AppendInt(buf[:0], epoch, 10)
+	_, _ = h.Write(epochBytes)
+	_, _ = h.Write([]byte{':'})
+	_, _ = h.Write([]byte(auth.ID))
+	return h.Sum64()
 }
 
 func (s *SimHashSelector) effectivePoolSizeLocked() int {

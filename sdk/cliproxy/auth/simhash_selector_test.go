@@ -9,7 +9,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
-func TestSimHashSelectorPrefersColdStartAuthsRoundRobin(t *testing.T) {
+func TestSimHashSelectorPrefersColdStartAuthsUntilPoolFills(t *testing.T) {
 	selector := NewSimHashSelector(internalconfig.RoutingSimHashConfig{PoolSize: 10})
 	auths := []*Auth{
 		{ID: "a", Provider: "codex", Status: StatusActive},
@@ -25,8 +25,8 @@ func TestSimHashSelectorPrefersColdStartAuthsRoundRobin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second pick error: %v", err)
 	}
-	if first.ID != "a" || second.ID != "b" {
-		t.Fatalf("cold-start order = %q, %q; want a, b", first.ID, second.ID)
+	if first == nil || second == nil || first.ID == second.ID {
+		t.Fatalf("expected cold-start to admit distinct auths, got %#v %#v", first, second)
 	}
 }
 
@@ -140,5 +140,54 @@ func TestSimHashSelectorPoolOnlyAdmitsOneNewAuthAfterFilled(t *testing.T) {
 	selected, err = selector.Pick(context.Background(), "codex", "gpt-5.4", cliproxyexecutor.Options{}, blockedAuths)
 	if err == nil {
 		t.Fatalf("expected pool admission cooldown to block outsider admission, got %v", selected)
+	}
+}
+
+func TestSimHashSelectorAdmissionOrderChangesAcrossEpochs(t *testing.T) {
+	auths := []*Auth{
+		{ID: "a", Provider: "codex", Status: StatusActive},
+		{ID: "b", Provider: "codex", Status: StatusActive},
+		{ID: "c", Provider: "codex", Status: StatusActive},
+	}
+	firstEpochPick := NewSimHashSelector(internalconfig.RoutingSimHashConfig{PoolSize: 10}).pickAdmissionCandidateLocked(time.Unix(0, 0), auths)
+	secondEpochPick := NewSimHashSelector(internalconfig.RoutingSimHashConfig{PoolSize: 10}).pickAdmissionCandidateLocked(time.Unix(int64((10*time.Minute)/time.Second), 0), auths)
+	if firstEpochPick == nil || secondEpochPick == nil {
+		t.Fatal("expected admission candidates")
+	}
+}
+
+func TestSimHashSelectorKeepsPreferredOutsiderUntilItChangesState(t *testing.T) {
+	selector := NewSimHashSelector(internalconfig.RoutingSimHashConfig{PoolSize: 1, AdmitCooldownSeconds: 3600})
+	now := time.Unix(0, 0)
+	outsiders := []*Auth{
+		{ID: "a", Provider: "codex", Status: StatusActive},
+		{ID: "b", Provider: "codex", Status: StatusActive},
+		{ID: "c", Provider: "codex", Status: StatusActive},
+	}
+
+	first := selector.pickAdmissionCandidateLocked(now, outsiders)
+	if first == nil {
+		t.Fatal("expected first candidate")
+	}
+	second := selector.pickAdmissionCandidateLocked(now.Add(5*time.Minute), outsiders)
+	if second == nil {
+		t.Fatal("expected second candidate")
+	}
+	if second.ID != first.ID {
+		t.Fatalf("preferred outsider drifted from %q to %q", first.ID, second.ID)
+	}
+
+	remaining := make([]*Auth, 0, len(outsiders)-1)
+	for _, auth := range outsiders {
+		if auth.ID != first.ID {
+			remaining = append(remaining, auth)
+		}
+	}
+	next := selector.pickAdmissionCandidateLocked(now.Add(6*time.Minute), remaining)
+	if next == nil {
+		t.Fatal("expected next candidate after removing preferred outsider")
+	}
+	if next.ID == first.ID {
+		t.Fatalf("expected preferred outsider to advance after removal, still got %q", next.ID)
 	}
 }
