@@ -116,3 +116,33 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 		})
 	}
 }
+
+func TestGetRequestDetails_DoesNotTreatActiveProviderAsModelSupport(t *testing.T) {
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
+	auth := &coreauth.Auth{
+		ID:       "test-request-details-codex-restricted",
+		Provider: "codex",
+	}
+	if _, err := handler.AuthManager.Register(nil, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{
+		{ID: "gpt-5.2"},
+	})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(auth.ID)
+	})
+
+	providers, model, errMsg := handler.getRequestDetails("gpt-5.4")
+	if errMsg == nil {
+		t.Fatalf("getRequestDetails() error = nil, want unknown provider")
+	}
+	if providers != nil {
+		t.Fatalf("getRequestDetails() providers = %v, want nil", providers)
+	}
+	if model != "" {
+		t.Fatalf("getRequestDetails() model = %q, want empty", model)
+	}
+}
