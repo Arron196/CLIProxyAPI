@@ -121,6 +121,82 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 	}
 }
 
+func TestFileSynthesizer_Synthesize_RestoresRuntimeState(t *testing.T) {
+	tempDir := t.TempDir()
+	next := time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC)
+	authData := map[string]any{
+		"type":  "claude",
+		"email": "test@example.com",
+		coreauth.PersistedRuntimeStateMetadataKey: map[string]any{
+			"status":           "error",
+			"status_message":   "quota exhausted",
+			"unavailable":      true,
+			"next_retry_after": next.Format(time.RFC3339),
+			"quota": map[string]any{
+				"exceeded":        true,
+				"reason":          "quota",
+				"next_recover_at": next.Format(time.RFC3339),
+				"backoff_level":   2,
+				"strike_count":    3,
+			},
+			"model_states": map[string]any{
+				"claude-sonnet": map[string]any{
+					"status":           "error",
+					"status_message":   "model quota",
+					"unavailable":      true,
+					"next_retry_after": next.Format(time.RFC3339),
+					"quota": map[string]any{
+						"exceeded":        true,
+						"reason":          "quota",
+						"next_recover_at": next.Format(time.RFC3339),
+						"backoff_level":   4,
+						"strike_count":    5,
+					},
+				},
+			},
+		},
+	}
+	data, _ := json.Marshal(authData)
+	if err := os.WriteFile(filepath.Join(tempDir, "claude-auth.json"), data, 0o644); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         next.Add(-time.Minute),
+		IDGenerator: NewStableIDGenerator(),
+	}
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	got := auths[0]
+	if got.Status != coreauth.StatusError {
+		t.Fatalf("got.Status = %q, want %q", got.Status, coreauth.StatusError)
+	}
+	if got.StatusMessage != "quota exhausted" {
+		t.Fatalf("got.StatusMessage = %q, want %q", got.StatusMessage, "quota exhausted")
+	}
+	if !got.NextRetryAfter.Equal(next) {
+		t.Fatalf("got.NextRetryAfter = %v, want %v", got.NextRetryAfter, next)
+	}
+	state := got.ModelStates["claude-sonnet"]
+	if state == nil {
+		t.Fatal("expected restored model state for claude-sonnet")
+	}
+	if !state.NextRetryAfter.Equal(next) {
+		t.Fatalf("model NextRetryAfter = %v, want %v", state.NextRetryAfter, next)
+	}
+	if _, ok := got.Metadata[coreauth.PersistedRuntimeStateMetadataKey]; ok {
+		t.Fatal("expected restored metadata to strip runtime state field")
+	}
+}
+
 func TestFileSynthesizer_Synthesize_GeminiProviderMapping(t *testing.T) {
 	tempDir := t.TempDir()
 

@@ -99,8 +99,8 @@ func TestNormalizeAuthStripsTemporalFields(t *testing.T) {
 	if normalized.Runtime != nil {
 		t.Fatal("expected runtime to be nil")
 	}
-	if !normalized.Quota.NextRecoverAt.IsZero() {
-		t.Fatal("expected quota.NextRecoverAt to be zeroed")
+	if !normalized.Quota.NextRecoverAt.Equal(now) {
+		t.Fatal("expected quota.NextRecoverAt to be preserved for runtime-state comparison")
 	}
 }
 

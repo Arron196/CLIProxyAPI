@@ -211,14 +211,21 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", fmt.Errorf("postgres store: create auth directory: %w", err)
 	}
+	type metadataSetter interface {
+		SetMetadata(map[string]any)
+	}
+	metadata := cliproxyauth.MetadataWithPersistedRuntimeState(auth)
 
 	switch {
 	case auth.Storage != nil:
+		if setter, ok := auth.Storage.(metadataSetter); ok {
+			setter.SetMetadata(metadata)
+		}
 		if err = auth.Storage.SaveTokenToFile(path); err != nil {
 			return "", err
 		}
-	case auth.Metadata != nil:
-		raw, errMarshal := json.Marshal(auth.Metadata)
+	case metadata != nil:
+		raw, errMarshal := json.Marshal(metadata)
 		if errMarshal != nil {
 			return "", fmt.Errorf("postgres store: marshal metadata: %w", errMarshal)
 		}
@@ -310,6 +317,7 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 			LastRefreshedAt:  time.Time{},
 			NextRefreshAfter: time.Time{},
 		}
+		cliproxyauth.RestorePersistedRuntimeState(auth, time.Now())
 		auths = append(auths, auth)
 	}
 	if err = rows.Err(); err != nil {

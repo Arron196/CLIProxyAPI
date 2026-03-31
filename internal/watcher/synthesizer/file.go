@@ -158,6 +158,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		}
 	}
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
+	coreauth.RestorePersistedRuntimeState(a, now)
 	// For codex auth files, extract plan_type from the JWT id_token.
 	if provider == "codex" {
 		if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {

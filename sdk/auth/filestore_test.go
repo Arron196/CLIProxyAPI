@@ -9,6 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -231,5 +234,112 @@ func TestFileTokenStoreListIgnoresNonAuthJSON(t *testing.T) {
 	}
 	if auths[0].Provider != "codex" {
 		t.Fatalf("auth provider = %q, want %q", auths[0].Provider, "codex")
+	}
+}
+
+func TestFileTokenStoreSaveAndListRoundTripRuntimeState(t *testing.T) {
+	tempDir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(tempDir)
+
+	next := time.Date(2026, 4, 1, 9, 45, 0, 0, time.UTC)
+	auth := &cliproxyauth.Auth{
+		ID:             "codex.json",
+		FileName:       "codex.json",
+		Provider:       "codex",
+		Status:         cliproxyauth.StatusError,
+		StatusMessage:  "quota exhausted",
+		Unavailable:    true,
+		NextRetryAfter: next,
+		Quota: cliproxyauth.QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: next,
+			BackoffLevel:  2,
+			StrikeCount:   3,
+		},
+		LastError: &cliproxyauth.Error{HTTPStatus: 429, Message: "quota"},
+		ModelStates: map[string]*cliproxyauth.ModelState{
+			"gpt-5.4": {
+				Status:         cliproxyauth.StatusError,
+				StatusMessage:  "model quota",
+				Unavailable:    true,
+				NextRetryAfter: next,
+				LastError:      &cliproxyauth.Error{HTTPStatus: 429, Message: "model quota"},
+				Quota: cliproxyauth.QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: next,
+					BackoffLevel:  4,
+					StrikeCount:   5,
+				},
+			},
+		},
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "user@example.com",
+		},
+	}
+
+	path, err := store.Save(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	runtimeState, ok := payload[cliproxyauth.PersistedRuntimeStateMetadataKey].(map[string]any)
+	if !ok {
+		t.Fatalf("persisted runtime state = %T, want map[string]any", payload[cliproxyauth.PersistedRuntimeStateMetadataKey])
+	}
+	if _, exists := runtimeState["last_error"]; exists {
+		t.Fatalf("persisted auth runtime state unexpectedly contains last_error: %#v", runtimeState)
+	}
+	modelStates, ok := runtimeState["model_states"].(map[string]any)
+	if !ok {
+		t.Fatalf("persisted model_states = %T, want map[string]any", runtimeState["model_states"])
+	}
+	modelState, ok := modelStates["gpt-5.4"].(map[string]any)
+	if !ok {
+		t.Fatalf("persisted model state = %T, want map[string]any", modelStates["gpt-5.4"])
+	}
+	if _, exists := modelState["last_error"]; exists {
+		t.Fatalf("persisted model runtime state unexpectedly contains last_error: %#v", modelState)
+	}
+
+	auths, err := store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("len(List()) = %d, want 1", len(auths))
+	}
+	got := auths[0]
+	if got.LastError != nil {
+		t.Fatalf("got.LastError = %#v, want nil", got.LastError)
+	}
+	if got.Status != cliproxyauth.StatusError {
+		t.Fatalf("got.Status = %q, want %q", got.Status, cliproxyauth.StatusError)
+	}
+	if got.StatusMessage != "quota exhausted" {
+		t.Fatalf("got.StatusMessage = %q, want %q", got.StatusMessage, "quota exhausted")
+	}
+	if !got.NextRetryAfter.Equal(next) {
+		t.Fatalf("got.NextRetryAfter = %v, want %v", got.NextRetryAfter, next)
+	}
+	state := got.ModelStates["gpt-5.4"]
+	if state == nil {
+		t.Fatal("expected restored model state for gpt-5.4")
+	}
+	if state.LastError != nil {
+		t.Fatalf("got model LastError = %#v, want nil", state.LastError)
+	}
+	if !state.NextRetryAfter.Equal(next) {
+		t.Fatalf("got model NextRetryAfter = %v, want %v", state.NextRetryAfter, next)
 	}
 }

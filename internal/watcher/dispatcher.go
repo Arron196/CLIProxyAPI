@@ -251,7 +251,6 @@ func normalizeAuth(a *coreauth.Auth) *coreauth.Auth {
 	clone.LastRefreshedAt = time.Time{}
 	clone.NextRefreshAfter = time.Time{}
 	clone.Runtime = nil
-	clone.Quota.NextRecoverAt = time.Time{}
 	return clone
 }
 
