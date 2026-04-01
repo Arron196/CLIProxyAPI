@@ -968,6 +968,31 @@ func TestResponsesWebsocketPrewarmHandledLocallyForSSEUpstream(t *testing.T) {
 	}
 }
 
+func TestWebsocketClientAddressUsesGinClientIP(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	c, engine := gin.CreateTestContext(recorder)
+	if err := engine.SetTrustedProxies([]string{"0.0.0.0/0", "::/0"}); err != nil {
+		t.Fatalf("SetTrustedProxies: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/responses/ws", nil)
+	req.RemoteAddr = "172.18.0.1:34282"
+	req.Header.Set("X-Forwarded-For", "203.0.113.7")
+	c.Request = req
+
+	if got := websocketClientAddress(c); got != strings.TrimSpace(c.ClientIP()) {
+		t.Fatalf("websocketClientAddress = %q, ClientIP = %q", got, c.ClientIP())
+	}
+}
+
+func TestWebsocketClientAddressReturnsEmptyForNilContext(t *testing.T) {
+	if got := websocketClientAddress(nil); got != "" {
+		t.Fatalf("websocketClientAddress(nil) = %q, want empty", got)
+	}
+}
+
 func TestResponsesWebsocketPinsOnlyWebsocketCapableAuth(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

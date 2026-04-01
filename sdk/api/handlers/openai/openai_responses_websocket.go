@@ -57,6 +57,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	passthroughSessionID := uuid.NewString()
 	log.Infof("responses websocket: client connected id=%s remote=%s", passthroughSessionID, websocketClientAddress(c))
 	downstreamSessionKey := websocketDownstreamSessionKey(c.Request)
+	retainResponsesWebsocketToolCaches(downstreamSessionKey)
 	var wsTerminateErr error
 	var wsBodyLog strings.Builder
 	toolPairState := acquireResponsesWebsocketToolPairState(downstreamSessionKey)
@@ -244,6 +245,13 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			lastResponseOutput = completedOutput
 		}
 	}
+}
+
+func websocketClientAddress(c *gin.Context) string {
+	if c == nil || c.Request == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.ClientIP())
 }
 
 func websocketUpgradeHeaders(req *http.Request) http.Header {
