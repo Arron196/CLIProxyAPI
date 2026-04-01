@@ -34,6 +34,35 @@ func TestFillFirstSelectorPick_Deterministic(t *testing.T) {
 	}
 }
 
+func TestFillFirstSelectorPick_FirstRegisteredAtWinsWithinSamePriority(t *testing.T) {
+	t.Parallel()
+
+	selector := &FillFirstSelector{}
+	older := time.Date(2026, 4, 1, 8, 0, 0, 0, time.UTC)
+	newer := older.Add(5 * time.Minute)
+	auths := []*Auth{
+		{
+			ID:       "a-newer",
+			Metadata: map[string]any{"type": "gemini", FirstRegisteredAtMetadataKey: newer.Format(time.RFC3339Nano)},
+		},
+		{
+			ID:       "z-older",
+			Metadata: map[string]any{"type": "gemini", FirstRegisteredAtMetadataKey: older.Format(time.RFC3339Nano)},
+		},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "z-older" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "z-older")
+	}
+}
+
 func TestRoundRobinSelectorPick_CyclesDeterministic(t *testing.T) {
 	t.Parallel()
 

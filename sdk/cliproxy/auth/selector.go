@@ -359,6 +359,7 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
+	sortAuthsByFirstRegisteredAt(available)
 	return available[0], nil
 }
 

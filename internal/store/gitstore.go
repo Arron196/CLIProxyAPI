@@ -451,6 +451,9 @@ func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, 
 		LastRefreshedAt:  time.Time{},
 		NextRefreshAfter: time.Time{},
 	}
+	if registeredAt, ok := cliproxyauth.FirstRegisteredAtFromMetadata(auth.Metadata); ok {
+		auth.CreatedAt = registeredAt
+	}
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		auth.Attributes["email"] = email
 	}

@@ -602,6 +602,9 @@ func (s *ObjectTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Aut
 		LastRefreshedAt:  time.Time{},
 		NextRefreshAfter: time.Time{},
 	}
+	if registeredAt, ok := cliproxyauth.FirstRegisteredAtFromMetadata(auth.Metadata); ok {
+		auth.CreatedAt = registeredAt
+	}
 	cliproxyauth.RestorePersistedRuntimeState(auth, time.Now())
 	return auth, nil
 }

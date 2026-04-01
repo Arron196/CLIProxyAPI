@@ -119,6 +119,39 @@ func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_FillFirstUsesFirstRegisteredAt(t *testing.T) {
+	t.Parallel()
+
+	older := time.Date(2026, 4, 1, 8, 0, 0, 0, time.UTC)
+	newer := older.Add(10 * time.Minute)
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{
+			ID:       "a-newer",
+			Provider: "gemini",
+			Metadata: map[string]any{"type": "gemini", FirstRegisteredAtMetadataKey: newer.Format(time.RFC3339Nano)},
+		},
+		&Auth{
+			ID:       "z-older",
+			Provider: "gemini",
+			Metadata: map[string]any{"type": "gemini", FirstRegisteredAtMetadataKey: older.Format(time.RFC3339Nano)},
+		},
+	)
+
+	for index := 0; index < 3; index++ {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", index)
+		}
+		if got.ID != "z-older" {
+			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, "z-older")
+		}
+	}
+}
+
 func TestSchedulerPick_PromotesExpiredCooldownBeforePick(t *testing.T) {
 	t.Parallel()
 

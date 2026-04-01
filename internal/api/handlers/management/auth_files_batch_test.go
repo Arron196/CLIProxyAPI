@@ -2,6 +2,7 @@ package management
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"mime/multipart"
 	"net/http"
@@ -73,8 +74,15 @@ func TestUploadAuthFile_BatchMultipart(t *testing.T) {
 		if err != nil {
 			t.Fatalf("expected uploaded file %s to exist: %v", file.name, err)
 		}
-		if string(data) != file.content {
-			t.Fatalf("expected file %s content %q, got %q", file.name, file.content, string(data))
+		var stored map[string]any
+		if err = json.Unmarshal(data, &stored); err != nil {
+			t.Fatalf("failed to decode stored file %s: %v", file.name, err)
+		}
+		if stored["type"] == nil {
+			t.Fatalf("expected stored file %s to keep type", file.name)
+		}
+		if _, ok := stored[coreauth.FirstRegisteredAtMetadataKey].(string); !ok {
+			t.Fatalf("expected stored file %s to include %s, got %#v", file.name, coreauth.FirstRegisteredAtMetadataKey, stored)
 		}
 	}
 
@@ -145,8 +153,12 @@ func TestUploadAuthFile_BatchMultipart_InvalidJSONDoesNotOverwriteExistingFile(t
 	if err != nil {
 		t.Fatalf("expected valid auth file to be created: %v", err)
 	}
-	if string(betaData) != files[1].content {
-		t.Fatalf("expected beta auth file content %q, got %q", files[1].content, string(betaData))
+	var betaStored map[string]any
+	if err = json.Unmarshal(betaData, &betaStored); err != nil {
+		t.Fatalf("failed to decode beta auth file: %v", err)
+	}
+	if _, ok := betaStored[coreauth.FirstRegisteredAtMetadataKey].(string); !ok {
+		t.Fatalf("expected beta auth file to include %s, got %#v", coreauth.FirstRegisteredAtMetadataKey, betaStored)
 	}
 }
 
@@ -193,6 +205,9 @@ func TestUploadAuthFile_BatchMultipart_TrimsTypeBeforeRegister(t *testing.T) {
 	}
 	if got, _ := auth.Metadata["type"].(string); got != "codex" {
 		t.Fatalf("auth metadata type = %q, want %q", got, "codex")
+	}
+	if _, ok := auth.Metadata[coreauth.FirstRegisteredAtMetadataKey].(string); !ok {
+		t.Fatalf("expected auth metadata to include %s, got %#v", coreauth.FirstRegisteredAtMetadataKey, auth.Metadata)
 	}
 }
 
@@ -252,6 +267,61 @@ func TestUploadAuthFile_BatchMultipart_RejectsBlankTypeWithoutWritingFile(t *tes
 	}
 	if auths[0].Provider != "claude" {
 		t.Fatalf("auth provider = %q, want %q", auths[0].Provider, "claude")
+	}
+}
+
+func TestUploadAuthFile_BatchMultipart_PreservesFirstRegisteredAtOnSameNameUpload(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	firstContent := `{"type":"codex","email":"alpha@example.com"}`
+	if err := h.writeAuthFile(context.Background(), "alpha.json", []byte(firstContent)); err != nil {
+		t.Fatalf("first writeAuthFile() error = %v", err)
+	}
+	firstAuth, ok := manager.GetByID("alpha.json")
+	if !ok || firstAuth == nil {
+		t.Fatalf("expected first auth to be registered")
+	}
+	firstRegisteredAt, ok := coreauth.FirstRegisteredAt(firstAuth)
+	if !ok {
+		t.Fatalf("expected first auth to have first registered time")
+	}
+
+	secondContent := `{"type":"codex","email":"alpha+updated@example.com"}`
+	if err := h.writeAuthFile(context.Background(), "alpha.json", []byte(secondContent)); err != nil {
+		t.Fatalf("second writeAuthFile() error = %v", err)
+	}
+
+	secondAuth, ok := manager.GetByID("alpha.json")
+	if !ok || secondAuth == nil {
+		t.Fatalf("expected updated auth to remain registered")
+	}
+	secondRegisteredAt, ok := coreauth.FirstRegisteredAt(secondAuth)
+	if !ok {
+		t.Fatalf("expected updated auth to keep first registered time")
+	}
+	if !secondRegisteredAt.Equal(firstRegisteredAt) {
+		t.Fatalf("first registered time changed from %s to %s", firstRegisteredAt, secondRegisteredAt)
+	}
+
+	data, err := os.ReadFile(filepath.Join(authDir, "alpha.json"))
+	if err != nil {
+		t.Fatalf("failed to read updated auth file: %v", err)
+	}
+	var stored map[string]any
+	if err = json.Unmarshal(data, &stored); err != nil {
+		t.Fatalf("failed to decode updated auth file: %v", err)
+	}
+	storedRegisteredAt, ok := coreauth.ParseFirstRegisteredAtValue(stored[coreauth.FirstRegisteredAtMetadataKey])
+	if !ok {
+		t.Fatalf("expected stored auth file to include %s", coreauth.FirstRegisteredAtMetadataKey)
+	}
+	if !storedRegisteredAt.Equal(firstRegisteredAt) {
+		t.Fatalf("stored first registered time = %s, want %s", storedRegisteredAt, firstRegisteredAt)
 	}
 }
 

@@ -317,6 +317,9 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 			LastRefreshedAt:  time.Time{},
 			NextRefreshAfter: time.Time{},
 		}
+		if registeredAt, ok := cliproxyauth.FirstRegisteredAtFromMetadata(auth.Metadata); ok {
+			auth.CreatedAt = registeredAt
+		}
 		cliproxyauth.RestorePersistedRuntimeState(auth, time.Now())
 		auths = append(auths, auth)
 	}

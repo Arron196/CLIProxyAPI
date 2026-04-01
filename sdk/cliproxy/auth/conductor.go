@@ -984,6 +984,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
+	EnsureFirstRegisteredAt(auth, auth.CreatedAt)
 	auth.EnsureIndex()
 	authClone := auth.Clone()
 	schedulerSnapshot := authClone.Clone()
@@ -1011,12 +1012,21 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 			auth.Index = existing.Index
 			auth.indexAssigned = existing.indexAssigned
 		}
+		if registeredAt, okRegisteredAt := FirstRegisteredAt(existing); okRegisteredAt {
+			auth.CreatedAt = registeredAt
+			if auth.Metadata != nil {
+				auth.Metadata[FirstRegisteredAtMetadataKey] = registeredAt.Format(time.RFC3339Nano)
+			}
+		} else if auth.CreatedAt.IsZero() {
+			auth.CreatedAt = existing.CreatedAt
+		}
 		if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 				auth.ModelStates = existing.ModelStates
 			}
 		}
 	}
+	EnsureFirstRegisteredAt(auth, auth.CreatedAt)
 	auth.EnsureIndex()
 	authClone := auth.Clone()
 	schedulerSnapshot := authClone.Clone()
@@ -1045,9 +1055,13 @@ func (m *Manager) Load(ctx context.Context) error {
 		return err
 	}
 	m.auths = make(map[string]*Auth, len(items))
+	pendingPersist := make([]*Auth, 0)
 	for _, auth := range items {
 		if auth == nil || auth.ID == "" {
 			continue
+		}
+		if _, changed := ensureFirstRegisteredAtWithChanged(auth, auth.CreatedAt); changed {
+			pendingPersist = append(pendingPersist, auth.Clone())
 		}
 		auth.EnsureIndex()
 		m.auths[auth.ID] = auth.Clone()
@@ -1059,6 +1073,9 @@ func (m *Manager) Load(ctx context.Context) error {
 	m.rebuildAPIKeyModelAliasLocked(cfg)
 	m.mu.Unlock()
 	m.syncScheduler()
+	for _, auth := range pendingPersist {
+		m.enqueuePersist(auth)
+	}
 	return nil
 }
 

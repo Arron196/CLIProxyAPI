@@ -253,11 +253,7 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 			files = append(files, entry)
 		}
 	}
-	sort.Slice(files, func(i, j int) bool {
-		nameI, _ := files[i]["name"].(string)
-		nameJ, _ := files[j]["name"].(string)
-		return strings.ToLower(nameI) < strings.ToLower(nameJ)
-	})
+	sortAuthFileEntries(files)
 	c.JSON(200, gin.H{"files": files})
 }
 
@@ -345,6 +341,11 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 			"type":    typeValue,
 			"email":   gjson.GetBytes(data, "email").String(),
 		}
+		firstRegisteredAt := info.ModTime()
+		if parsed, ok := coreauth.ParseFirstRegisteredAtValue(gjson.GetBytes(data, coreauth.FirstRegisteredAtMetadataKey).String()); ok {
+			firstRegisteredAt = parsed
+		}
+		fileData["first_registered_at"] = firstRegisteredAt
 		if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
 			switch pv.Type {
 			case gjson.Number:
@@ -363,6 +364,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 
 		files = append(files, fileData)
 	}
+	sortAuthFileEntries(files)
 	c.JSON(200, gin.H{"files": files})
 }
 
@@ -411,6 +413,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if !auth.CreatedAt.IsZero() {
 		entry["created_at"] = auth.CreatedAt
+	}
+	if firstRegisteredAt, ok := coreauth.FirstRegisteredAt(auth); ok {
+		entry["first_registered_at"] = firstRegisteredAt
 	}
 	if !auth.UpdatedAt.IsZero() {
 		entry["modtime"] = auth.UpdatedAt
@@ -473,6 +478,52 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		}
 	}
 	return entry
+}
+
+func sortAuthFileEntries(files []gin.H) {
+	if len(files) <= 1 {
+		return
+	}
+	sort.Slice(files, func(i, j int) bool {
+		leftTime := authFileEntryFirstRegisteredAt(files[i])
+		rightTime := authFileEntryFirstRegisteredAt(files[j])
+		switch {
+		case leftTime.IsZero() != rightTime.IsZero():
+			return !leftTime.IsZero()
+		case !leftTime.Equal(rightTime):
+			return leftTime.Before(rightTime)
+		}
+		nameI := strings.ToLower(strings.TrimSpace(authFileEntryName(files[i])))
+		nameJ := strings.ToLower(strings.TrimSpace(authFileEntryName(files[j])))
+		return nameI < nameJ
+	})
+}
+
+func authFileEntryFirstRegisteredAt(entry gin.H) time.Time {
+	if entry == nil {
+		return time.Time{}
+	}
+	if value, ok := entry["first_registered_at"]; ok {
+		if ts, okTS := coreauth.ParseFirstRegisteredAtValue(value); okTS {
+			return ts
+		}
+	}
+	if value, ok := entry["created_at"]; ok {
+		if ts, okTS := coreauth.ParseFirstRegisteredAtValue(value); okTS {
+			return ts
+		}
+	}
+	return time.Time{}
+}
+
+func authFileEntryName(entry gin.H) string {
+	if entry == nil {
+		return ""
+	}
+	if name, ok := entry["name"].(string); ok {
+		return name
+	}
+	return ""
 }
 
 func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {
@@ -814,7 +865,15 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	if err != nil {
 		return err
 	}
-	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
+	payload := data
+	if auth.Metadata != nil {
+		normalized, errMarshal := json.Marshal(auth.Metadata)
+		if errMarshal != nil {
+			return fmt.Errorf("failed to marshal normalized auth file: %w", errMarshal)
+		}
+		payload = normalized
+	}
+	if errWrite := os.WriteFile(dst, payload, 0o600); errWrite != nil {
 		return fmt.Errorf("failed to write file: %w", errWrite)
 	}
 	if err := h.upsertAuthRecord(ctx, auth); err != nil {
@@ -1042,7 +1101,12 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	}
 	if h != nil && h.authManager != nil {
 		if existing, ok := h.authManager.GetByID(authID); ok {
-			auth.CreatedAt = existing.CreatedAt
+			if registeredAt, okRegisteredAt := coreauth.FirstRegisteredAt(existing); okRegisteredAt {
+				auth.CreatedAt = registeredAt
+				auth.Metadata[coreauth.FirstRegisteredAtMetadataKey] = registeredAt.Format(time.RFC3339Nano)
+			} else {
+				auth.CreatedAt = existing.CreatedAt
+			}
 			if !hasLastRefresh {
 				auth.LastRefreshedAt = existing.LastRefreshedAt
 			}
@@ -1050,6 +1114,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 			auth.Runtime = existing.Runtime
 		}
 	}
+	coreauth.EnsureFirstRegisteredAt(auth, auth.CreatedAt)
 	return auth, nil
 }
 

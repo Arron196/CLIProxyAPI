@@ -1372,7 +1372,7 @@ func pickReadyFromView(view *readyView, strategy schedulerStrategy, predicate fu
 		return nil
 	}
 	if strategy == schedulerStrategyFillFirst {
-		return view.pickFirst(predicate)
+		return view.pickFirstRegistered(predicate)
 	}
 	return view.pickRoundRobin(predicate)
 }
@@ -1562,6 +1562,32 @@ func (v *readyView) pickFirst(predicate func(*scheduledAuth) bool) *scheduledAut
 		}
 	}
 	return nil
+}
+
+// pickFirstRegistered 返回首次入池时间最早的 ready entry。
+// fill-first 的目标语义是“先注册的账号先用”，所以这里不能继续依赖
+// flat 切片当前的 auth.ID 顺序，而是要显式比较稳定首次入池时间。
+func (v *readyView) pickFirstRegistered(predicate func(*scheduledAuth) bool) *scheduledAuth {
+	var picked *scheduledAuth
+	for _, entry := range v.flat {
+		if predicate != nil && !predicate(entry) {
+			continue
+		}
+		if picked == nil || scheduledAuthFirstRegisteredLess(entry, picked) {
+			picked = entry
+		}
+	}
+	return picked
+}
+
+func scheduledAuthFirstRegisteredLess(left, right *scheduledAuth) bool {
+	if left == nil {
+		return false
+	}
+	if right == nil {
+		return true
+	}
+	return firstRegisteredAtLess(left.auth, right.auth)
 }
 
 // pickRoundRobin returns the next ready entry using flat or grouped round-robin traversal.
