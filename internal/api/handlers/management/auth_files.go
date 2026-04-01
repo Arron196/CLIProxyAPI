@@ -335,11 +335,12 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 		}
 
 		fileData := gin.H{
-			"name":    name,
-			"size":    info.Size(),
-			"modtime": info.ModTime(),
-			"type":    typeValue,
-			"email":   gjson.GetBytes(data, "email").String(),
+			"name":              name,
+			"size":              info.Size(),
+			"modtime":           info.ModTime(),
+			"type":              typeValue,
+			"email":             gjson.GetBytes(data, "email").String(),
+			"has_refresh_token": authFileDataHasRefreshToken(data),
 		}
 		firstRegisteredAt := info.ModTime()
 		if parsed, ok := coreauth.ParseFirstRegisteredAtValue(gjson.GetBytes(data, coreauth.FirstRegisteredAtMetadataKey).String()); ok {
@@ -386,19 +387,20 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		name = auth.ID
 	}
 	entry := gin.H{
-		"id":             auth.ID,
-		"auth_index":     auth.Index,
-		"name":           name,
-		"type":           strings.TrimSpace(auth.Provider),
-		"provider":       strings.TrimSpace(auth.Provider),
-		"label":          auth.Label,
-		"status":         auth.Status,
-		"status_message": auth.StatusMessage,
-		"disabled":       auth.Disabled,
-		"unavailable":    auth.Unavailable,
-		"runtime_only":   runtimeOnly,
-		"source":         "memory",
-		"size":           int64(0),
+		"id":                auth.ID,
+		"auth_index":        auth.Index,
+		"name":              name,
+		"type":              strings.TrimSpace(auth.Provider),
+		"provider":          strings.TrimSpace(auth.Provider),
+		"label":             auth.Label,
+		"status":            auth.Status,
+		"status_message":    auth.StatusMessage,
+		"disabled":          auth.Disabled,
+		"unavailable":       auth.Unavailable,
+		"runtime_only":      runtimeOnly,
+		"source":            "memory",
+		"size":              int64(0),
+		"has_refresh_token": authMetadataHasRefreshToken(auth.Metadata),
 	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
@@ -524,6 +526,29 @@ func authFileEntryName(entry gin.H) string {
 		return name
 	}
 	return ""
+}
+
+func authMetadataHasRefreshToken(metadata map[string]any) bool {
+	if metadata == nil {
+		return false
+	}
+	value, ok := metadata["refresh_token"].(string)
+	if !ok {
+		return false
+	}
+	return strings.TrimSpace(value) != ""
+}
+
+func authFileDataHasRefreshToken(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	for _, path := range []string{"refresh_token", "metadata.refresh_token", "token.refresh_token"} {
+		if strings.TrimSpace(gjson.GetBytes(data, path).String()) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {

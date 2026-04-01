@@ -138,3 +138,130 @@ func TestListAuthFilesFromDisk_SortsByFirstRegisteredAt(t *testing.T) {
 		t.Fatalf("first file name = %#v, want %q", got, "z-older.json")
 	}
 }
+
+func TestListAuthFiles_ExposesHasRefreshToken(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+
+	withRefreshPath := filepath.Join(authDir, "with-refresh.json")
+	withoutRefreshPath := filepath.Join(authDir, "without-refresh.json")
+	if err := os.WriteFile(withRefreshPath, []byte(`{"type":"codex"}`), 0o600); err != nil {
+		t.Fatalf("write with refresh file: %v", err)
+	}
+	if err := os.WriteFile(withoutRefreshPath, []byte(`{"type":"codex"}`), 0o600); err != nil {
+		t.Fatalf("write without refresh file: %v", err)
+	}
+
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "with-refresh.json",
+		FileName: "with-refresh.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": withRefreshPath,
+		},
+		Metadata: map[string]any{
+			"type":          "codex",
+			"refresh_token": "refresh-token",
+		},
+	}); err != nil {
+		t.Fatalf("register with refresh auth: %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "without-refresh.json",
+		FileName: "without-refresh.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": withoutRefreshPath,
+		},
+		Metadata: map[string]any{
+			"type":          "codex",
+			"refresh_token": "   ",
+		},
+	}); err != nil {
+		t.Fatalf("register without refresh auth: %v", err)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
+
+	h.ListAuthFiles(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d body=%s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Files []map[string]any `json:"files"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	byName := make(map[string]map[string]any, len(payload.Files))
+	for _, file := range payload.Files {
+		name, _ := file["name"].(string)
+		byName[name] = file
+	}
+
+	if got, ok := byName["with-refresh.json"]["has_refresh_token"].(bool); !ok || !got {
+		t.Fatalf("with-refresh has_refresh_token = %#v, want true", byName["with-refresh.json"]["has_refresh_token"])
+	}
+	if got, ok := byName["without-refresh.json"]["has_refresh_token"].(bool); !ok || got {
+		t.Fatalf("without-refresh has_refresh_token = %#v, want false", byName["without-refresh.json"]["has_refresh_token"])
+	}
+}
+
+func TestListAuthFilesFromDisk_ExposesHasRefreshToken(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(authDir, "with-refresh.json"),
+		[]byte(`{"type":"codex","refresh_token":"refresh-token"}`),
+		0o600,
+	); err != nil {
+		t.Fatalf("write with refresh file: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(authDir, "without-refresh.json"),
+		[]byte(`{"type":"codex","refresh_token":"   "}`),
+		0o600,
+	); err != nil {
+		t.Fatalf("write without refresh file: %v", err)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
+
+	h.ListAuthFiles(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d body=%s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Files []map[string]any `json:"files"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	byName := make(map[string]map[string]any, len(payload.Files))
+	for _, file := range payload.Files {
+		name, _ := file["name"].(string)
+		byName[name] = file
+	}
+
+	if got, ok := byName["with-refresh.json"]["has_refresh_token"].(bool); !ok || !got {
+		t.Fatalf("with-refresh has_refresh_token = %#v, want true", byName["with-refresh.json"]["has_refresh_token"])
+	}
+	if got, ok := byName["without-refresh.json"]["has_refresh_token"].(bool); !ok || got {
+		t.Fatalf("without-refresh has_refresh_token = %#v, want false", byName["without-refresh.json"]["has_refresh_token"])
+	}
+}
