@@ -1,7 +1,10 @@
+//go:build integration
+
 package executor
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +14,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	tls "github.com/refraction-networking/utls"
@@ -136,11 +140,15 @@ func TestCodexAccountCheck(t *testing.T) {
 	if accessToken == "" {
 		t.Skip("skipping: CODEX_ACCESS_TOKEN not set")
 	}
+	t.Helper()
 	proxyURL := os.Getenv("CODEX_PROXY_URL")
 	deviceID := uuid.NewString()
 	targetURL := "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=-480"
 
-	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
@@ -162,6 +170,7 @@ func TestCodexAccountCheck(t *testing.T) {
 
 	client := &http.Client{
 		Transport: newUtlsTransport(proxyURL),
+		Timeout:   20 * time.Second,
 	}
 
 	resp, err := client.Do(req)

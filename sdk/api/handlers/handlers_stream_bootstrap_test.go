@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -137,6 +138,7 @@ type authAwareStreamExecutor struct {
 type invalidJSONStreamExecutor struct{}
 
 type splitResponsesEventStreamExecutor struct{}
+type bootstrapHeaderStreamExecutor struct{}
 
 func (e *invalidJSONStreamExecutor) Identifier() string { return "codex" }
 
@@ -190,6 +192,48 @@ func (e *splitResponsesEventStreamExecutor) CountTokens(context.Context, *coreau
 }
 
 func (e *splitResponsesEventStreamExecutor) HttpRequest(ctx context.Context, auth *coreauth.Auth, req *http.Request) (*http.Response, error) {
+	return nil, &coreauth.Error{
+		Code:       "not_implemented",
+		Message:    "HttpRequest not implemented",
+		HTTPStatus: http.StatusNotImplemented,
+	}
+}
+
+func (e *bootstrapHeaderStreamExecutor) Identifier() string { return "bootstrap-headers" }
+
+func (e *bootstrapHeaderStreamExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "Execute not implemented"}
+}
+
+func (e *bootstrapHeaderStreamExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	ch := make(chan coreexecutor.StreamChunk, 1)
+	ch <- coreexecutor.StreamChunk{
+		Err: &coreauth.Error{
+			Code:       "rate_limited",
+			Message:    "rate limited",
+			Retryable:  true,
+			HTTPStatus: http.StatusTooManyRequests,
+		},
+	}
+	close(ch)
+	return &coreexecutor.StreamResult{
+		Headers: http.Header{
+			"Retry-After": {"17"},
+			"X-Upstream":  {"bootstrap"},
+		},
+		Chunks: ch,
+	}, nil
+}
+
+func (e *bootstrapHeaderStreamExecutor) Refresh(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *bootstrapHeaderStreamExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "CountTokens not implemented"}
+}
+
+func (e *bootstrapHeaderStreamExecutor) HttpRequest(ctx context.Context, auth *coreauth.Auth, req *http.Request) (*http.Response, error) {
 	return nil, &coreauth.Error{
 		Code:       "not_implemented",
 		Message:    "HttpRequest not implemented",
@@ -686,5 +730,61 @@ func TestExecuteStreamWithAuthManager_AllowsSplitOpenAIResponsesSSEEventLines(t 
 	expectedData := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}"
 	if got[1] != expectedData {
 		t.Fatalf("unexpected second chunk.\nGot:  %q\nWant: %q", got[1], expectedData)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_PreservesBootstrapHeadersOnImmediateWrappedError(t *testing.T) {
+	executor := &bootstrapHeaderStreamExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth1 := &coreauth.Auth{
+		ID:       "auth-bootstrap",
+		Provider: executor.Identifier(),
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"email": "bootstrap@example.com"},
+	}
+	if _, err := manager.Register(context.Background(), auth1); err != nil {
+		t.Fatalf("manager.Register(auth1): %v", err)
+	}
+
+	registry.GetGlobalRegistry().RegisterClient(auth1.ID, auth1.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth1.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		PassthroughHeaders: true,
+		Streaming: sdkconfig.StreamingConfig{
+			BootstrapRetries: 0,
+		},
+	}, manager)
+
+	dataChan, upstreamHeaders, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "test-model", []byte(`{"model":"test-model"}`), "")
+	if dataChan == nil || errChan == nil {
+		t.Fatalf("expected non-nil channels")
+	}
+
+	for chunk := range dataChan {
+		t.Fatalf("unexpected payload chunk: %q", string(chunk))
+	}
+
+	var gotErr *interfaces.ErrorMessage
+	for msg := range errChan {
+		if msg != nil {
+			gotErr = msg
+		}
+	}
+	if gotErr == nil || gotErr.Error == nil {
+		t.Fatalf("expected terminal error")
+	}
+	if gotErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", gotErr.StatusCode, http.StatusTooManyRequests)
+	}
+	if gotErr.Addon == nil || gotErr.Addon.Get("Retry-After") != "17" {
+		t.Fatalf("addon headers = %#v, want Retry-After=17", gotErr.Addon)
+	}
+	if upstreamHeaders == nil || upstreamHeaders.Get("Retry-After") != "17" {
+		t.Fatalf("upstream headers = %#v, want Retry-After=17", upstreamHeaders)
 	}
 }

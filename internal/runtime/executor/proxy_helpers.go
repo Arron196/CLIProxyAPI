@@ -12,12 +12,14 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
+	"golang.org/x/net/http/httpproxy"
 	log "github.com/sirupsen/logrus"
 )
 
 var (
 	proxyHTTPTransportCache      sync.Map // map[string]*cachedProxyTransport
 	environmentProxyKeys         = []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"}
+	environmentNoProxyKeys       = []string{"NO_PROXY", "no_proxy"}
 	environmentProxyTransportCache sync.Map // map[string]*http.Transport
 )
 
@@ -128,53 +130,20 @@ func environmentProxySignature() string {
 	for _, key := range environmentProxyKeys {
 		values = append(values, key+"="+strings.TrimSpace(os.Getenv(key)))
 	}
+	for _, key := range environmentNoProxyKeys {
+		values = append(values, key+"="+strings.TrimSpace(os.Getenv(key)))
+	}
 	return strings.Join(values, "|")
 }
 
 func environmentProxyFunc() func(*http.Request) (*url.URL, error) {
-	httpProxy := firstEnvironmentValue("HTTP_PROXY", "http_proxy")
-	httpsProxy := firstEnvironmentValue("HTTPS_PROXY", "https_proxy")
-	allProxy := firstEnvironmentValue("ALL_PROXY", "all_proxy")
+	cfg := httpproxy.FromEnvironment()
+	proxyFunc := cfg.ProxyFunc()
 
 	return func(req *http.Request) (*url.URL, error) {
 		if req == nil || req.URL == nil {
 			return nil, nil
 		}
-
-		raw := ""
-		switch strings.ToLower(req.URL.Scheme) {
-		case "https":
-			raw = firstNonEmpty(httpsProxy, allProxy, httpProxy)
-		case "http":
-			raw = firstNonEmpty(httpProxy, allProxy, httpsProxy)
-		default:
-			raw = firstNonEmpty(allProxy, httpsProxy, httpProxy)
-		}
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
-			return nil, nil
-		}
-		if !strings.Contains(raw, "://") {
-			raw = "http://" + raw
-		}
-		return url.Parse(raw)
+		return proxyFunc(req.URL)
 	}
-}
-
-func firstEnvironmentValue(keys ...string) string {
-	for _, key := range keys {
-		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
-			return value
-		}
-	}
-	return ""
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
 }

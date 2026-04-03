@@ -155,6 +155,40 @@ func TestNewProxyAwareHTTPClientExplicitProxyWinsOverEnvironmentProxy(t *testing
 	}
 }
 
+func TestNewProxyAwareHTTPClientHonorsNoProxy(t *testing.T) {
+	setEnvironmentProxy(t, "http://env-proxy.example.com:8080")
+
+	oldNoProxy, hadNoProxy := os.LookupEnv("NO_PROXY")
+	if err := os.Setenv("NO_PROXY", "example.com"); err != nil {
+		t.Fatalf("Setenv(NO_PROXY): %v", err)
+	}
+	t.Cleanup(func() {
+		if hadNoProxy {
+			_ = os.Setenv("NO_PROXY", oldNoProxy)
+			return
+		}
+		_ = os.Unsetenv("NO_PROXY")
+	})
+
+	client := newProxyAwareHTTPClient(context.Background(), &config.Config{}, &cliproxyauth.Auth{}, 0)
+
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", client.Transport)
+	}
+	req, errReq := http.NewRequest(http.MethodGet, "https://example.com", nil)
+	if errReq != nil {
+		t.Fatalf("NewRequest() error = %v", errReq)
+	}
+	proxyURL, errProxy := transport.Proxy(req)
+	if errProxy != nil {
+		t.Fatalf("transport.Proxy() error = %v", errProxy)
+	}
+	if proxyURL != nil {
+		t.Fatalf("proxy URL = %v, want nil for NO_PROXY match", proxyURL)
+	}
+}
+
 func TestNewProxyAwareHTTPClientReusesEnvironmentProxyTransport(t *testing.T) {
 	setEnvironmentProxy(t, "http://env-proxy.example.com:8080")
 

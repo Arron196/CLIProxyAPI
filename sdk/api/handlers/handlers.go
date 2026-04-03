@@ -780,7 +780,11 @@ func streamResultFromError(err error) *coreexecutor.StreamResult {
 	errCh := make(chan coreexecutor.StreamChunk, 1)
 	errCh <- coreexecutor.StreamChunk{Err: err}
 	close(errCh)
-	return &coreexecutor.StreamResult{Chunks: errCh}
+	var headers http.Header
+	if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
+		headers = cloneHeader(FilterUpstreamHeaders(he.Headers()))
+	}
+	return &coreexecutor.StreamResult{Headers: headers, Chunks: errCh}
 }
 
 func validateSSEDataJSON(chunk []byte) error {
