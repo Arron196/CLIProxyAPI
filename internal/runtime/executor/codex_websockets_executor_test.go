@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -436,5 +438,250 @@ func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 
 	if dialer.Proxy != nil {
 		t.Fatal("expected websocket proxy function to be nil for direct mode")
+	}
+}
+
+func TestReadCodexWebsocketMessageReturnsWhenReadChannelClosed(t *testing.T) {
+	t.Parallel()
+
+	sess := &codexWebsocketSession{}
+	conn := &websocket.Conn{}
+	readCh := make(chan codexWebsocketRead)
+	close(readCh)
+
+	_, _, err := readCodexWebsocketMessage(context.Background(), sess, conn, readCh)
+	if err == nil {
+		t.Fatal("expected error when session read channel is closed")
+	}
+	if !strings.Contains(err.Error(), "session read channel closed") {
+		t.Fatalf("error = %v, want contains session read channel closed", err)
+	}
+}
+
+func TestEnsureUpstreamConnReconnectsWhenAuthChanges(t *testing.T) {
+	var (
+		mu             sync.Mutex
+		authorizations []string
+	)
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		mu.Lock()
+		authorizations = append(authorizations, strings.TrimSpace(r.Header.Get("Authorization")))
+		mu.Unlock()
+
+		go func() {
+			defer func() {
+				_ = conn.Close()
+			}()
+			for {
+				if _, _, errRead := conn.ReadMessage(); errRead != nil {
+					return
+				}
+			}
+		}()
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	executor := NewCodexWebsocketsExecutor(&config.Config{})
+	sess := executor.getOrCreateSession("test-session")
+	if sess == nil {
+		t.Fatal("expected session to be created")
+	}
+
+	auth1 := &cliproxyauth.Auth{ID: "auth-1"}
+	headers1 := http.Header{}
+	headers1.Set("Authorization", "Bearer token-1")
+	conn1, _, errDial1 := executor.ensureUpstreamConn(context.Background(), auth1, sess, auth1.ID, wsURL, headers1)
+	if errDial1 != nil {
+		t.Fatalf("first ensureUpstreamConn failed: %v", errDial1)
+	}
+	if conn1 == nil {
+		t.Fatal("first ensureUpstreamConn returned nil connection")
+	}
+
+	auth2 := &cliproxyauth.Auth{ID: "auth-2"}
+	headers2 := http.Header{}
+	headers2.Set("Authorization", "Bearer token-2")
+	conn2, _, errDial2 := executor.ensureUpstreamConn(context.Background(), auth2, sess, auth2.ID, wsURL, headers2)
+	if errDial2 != nil {
+		t.Fatalf("second ensureUpstreamConn failed: %v", errDial2)
+	}
+	if conn2 == nil {
+		t.Fatal("second ensureUpstreamConn returned nil connection")
+	}
+	if conn1 == conn2 {
+		t.Fatal("expected auth change to force upstream reconnect")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		count := len(authorizations)
+		mu.Unlock()
+		if count >= 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mu.Lock()
+	got := append([]string(nil), authorizations...)
+	mu.Unlock()
+	if len(got) < 2 {
+		t.Fatalf("handshake count = %d, want at least 2", len(got))
+	}
+	if got[0] != "Bearer token-1" {
+		t.Fatalf("first Authorization = %q, want %q", got[0], "Bearer token-1")
+	}
+	if got[1] != "Bearer token-2" {
+		t.Fatalf("second Authorization = %q, want %q", got[1], "Bearer token-2")
+	}
+
+	executor.closeExecutionSession(sess, "test_done")
+}
+
+func TestCloseExecutionSessionUnblocksActiveRead(t *testing.T) {
+	t.Parallel()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serverConnCh := make(chan *websocket.Conn, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		serverConnCh <- conn
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	clientConn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	var serverConn *websocket.Conn
+	select {
+	case serverConn = <-serverConnCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server websocket connection")
+	}
+
+	sess := &codexWebsocketSession{
+		sessionID:  "session-close",
+		conn:       serverConn,
+		readerConn: serverConn,
+	}
+	readCh := make(chan codexWebsocketRead, 4)
+	sess.setActive(readCh)
+
+	executor := &CodexWebsocketsExecutor{
+		CodexExecutor: &CodexExecutor{},
+		sessions: map[string]*codexWebsocketSession{
+			"session-close": sess,
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	readErrCh := make(chan error, 1)
+	go func() {
+		_, _, err := readCodexWebsocketMessage(ctx, sess, serverConn, readCh)
+		readErrCh <- err
+	}()
+
+	executor.CloseExecutionSession("session-close")
+
+	select {
+	case err := <-readErrCh:
+		if err == nil {
+			t.Fatal("expected read error after closing execution session")
+		}
+		errText := err.Error()
+		if !strings.Contains(errText, "execution session closed") && !strings.Contains(errText, "session read channel closed") {
+			t.Fatalf("error = %v, want fast-fail error from session close path", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("read did not fail fast after closeExecutionSession")
+	}
+}
+
+func TestEnsureUpstreamConnAuthSwitchRebuildsWebsocketConn(t *testing.T) {
+	t.Parallel()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	authHeaderCh := make(chan string, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		authHeaderCh <- strings.TrimSpace(r.Header.Get("Authorization"))
+		for {
+			_, _, errRead := conn.ReadMessage()
+			if errRead != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	executor := NewCodexWebsocketsExecutor(&config.Config{})
+	sess := &codexWebsocketSession{sessionID: "session-auth-switch"}
+
+	headers1 := http.Header{}
+	headers1.Set("Authorization", "Bearer token-1")
+	conn1, _, errDial1 := executor.ensureUpstreamConn(context.Background(), nil, sess, "auth-1", wsURL, headers1)
+	if errDial1 != nil {
+		t.Fatalf("ensureUpstreamConn auth-1 error: %v", errDial1)
+	}
+	if conn1 == nil {
+		t.Fatal("ensureUpstreamConn auth-1 returned nil conn")
+	}
+
+	headers2 := http.Header{}
+	headers2.Set("Authorization", "Bearer token-2")
+	conn2, _, errDial2 := executor.ensureUpstreamConn(context.Background(), nil, sess, "auth-2", wsURL, headers2)
+	if errDial2 != nil {
+		t.Fatalf("ensureUpstreamConn auth-2 error: %v", errDial2)
+	}
+	if conn2 == nil {
+		t.Fatal("ensureUpstreamConn auth-2 returned nil conn")
+	}
+	if conn2 == conn1 {
+		t.Fatal("expected new websocket conn after auth switch")
+	}
+
+	defer executor.invalidateUpstreamConn(sess, conn2, "test_done", nil)
+
+	var got1, got2 string
+	select {
+	case got1 = <-authHeaderCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first websocket handshake")
+	}
+	select {
+	case got2 = <-authHeaderCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for second websocket handshake")
+	}
+	if got1 != "Bearer token-1" {
+		t.Fatalf("first Authorization = %q, want %q", got1, "Bearer token-1")
+	}
+	if got2 != "Bearer token-2" {
+		t.Fatalf("second Authorization = %q, want %q", got2, "Bearer token-2")
+	}
+	if got1 == got2 {
+		t.Fatal("expected different Authorization headers after auth switch")
 	}
 }

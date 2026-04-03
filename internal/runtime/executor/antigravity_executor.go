@@ -75,8 +75,11 @@ func NewAntigravityExecutor(cfg *config.Config) *AntigravityExecutor {
 // It is initialized once via antigravityTransportOnce to avoid leaking a new connection pool
 // (and the goroutines managing it) on every request.
 var (
-	antigravityTransport     *http.Transport
-	antigravityTransportOnce sync.Once
+	antigravityTransport                 *http.Transport
+	antigravityTransportOnce             sync.Once
+	antigravityEnvironmentProxyTransport = sync.OnceValue(func() *http.Transport {
+		return cloneTransportWithHTTP11(newEnvironmentProxyTransport())
+	})
 )
 
 func cloneTransportWithHTTP11(base *http.Transport) *http.Transport {
@@ -122,6 +125,10 @@ func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cli
 
 	// Preserve proxy settings from proxy-aware transports while forcing HTTP/1.1.
 	if transport, ok := client.Transport.(*http.Transport); ok {
+		if transport == newEnvironmentProxyTransport() {
+			client.Transport = antigravityEnvironmentProxyTransport()
+			return client
+		}
 		client.Transport = cloneTransportWithHTTP11(transport)
 	}
 	return client
@@ -205,6 +212,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.trackFailure(ctx, &err)
+	defer reporter.ensurePublished(ctx)
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("antigravity")
@@ -347,6 +355,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.trackFailure(ctx, &err)
+	defer reporter.ensurePublished(ctx)
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("antigravity")
@@ -739,6 +748,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.trackFailure(ctx, &err)
+	defer reporter.ensurePublished(ctx)
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("antigravity")

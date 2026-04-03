@@ -3,6 +3,8 @@ package executor
 import (
 	"context"
 	"net/http"
+	"os"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -14,7 +16,9 @@ import (
 )
 
 var (
-	proxyHTTPTransportCache sync.Map // map[string]*cachedProxyTransport
+	proxyHTTPTransportCache      sync.Map // map[string]*cachedProxyTransport
+	environmentProxyKeys         = []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"}
+	environmentProxyTransportCache sync.Map // map[string]*http.Transport
 )
 
 type cachedProxyTransport struct {
@@ -25,16 +29,8 @@ type cachedProxyTransport struct {
 // newProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
 // 1. Use auth.ProxyURL if configured (highest priority)
 // 2. Use cfg.ProxyURL if auth proxy is not configured
-// 3. Use RoundTripper from context if neither are configured
-//
-// Parameters:
-//   - ctx: The context containing optional RoundTripper
-//   - cfg: The application configuration
-//   - auth: The authentication information
-//   - timeout: The client timeout (0 means no timeout)
-//
-// Returns:
-//   - *http.Client: An HTTP client with configured proxy or transport
+// 3. Use environment proxy settings if neither are configured
+// 4. Use RoundTripper from context if no explicit or environment proxy is configured
 func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
 	var contextTransport http.RoundTripper
 	if ctx != nil {
@@ -43,29 +39,23 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		}
 	}
 
-	// Priority 1: Use auth.ProxyURL if configured
 	var proxyURL string
 	if auth != nil {
 		proxyURL = strings.TrimSpace(auth.ProxyURL)
 	}
-
-	// Priority 2: Use cfg.ProxyURL if auth proxy is not configured
 	if proxyURL == "" && cfg != nil {
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 
-	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
-	if contextTransport != nil && proxyURL == "" {
-		return newProxyHTTPClient(contextTransport, timeout)
-	}
-
-	// If we have a proxy URL configured, set up the transport
 	if proxyURL != "" {
 		if transport := cachedTransportForProxyURL(proxyURL); transport != nil {
 			return newProxyHTTPClient(transport, timeout)
 		}
-		// If proxy setup failed, fall through to context RoundTripper.
 		log.Debugf("failed to setup proxy from URL: %s, falling back to context transport", proxyURL)
+	}
+
+	if environmentProxyConfigured() {
+		return newProxyHTTPClient(newEnvironmentProxyTransport(), timeout)
 	}
 
 	if contextTransport != nil {
@@ -96,14 +86,6 @@ func newProxyHTTPClient(transport http.RoundTripper, timeout time.Duration) *htt
 	return client
 }
 
-// buildProxyTransport creates an HTTP transport configured for the given proxy URL.
-// It supports SOCKS5, HTTP, and HTTPS proxy protocols.
-//
-// Parameters:
-//   - proxyURL: The proxy URL string (e.g., "socks5://user:pass@host:port", "http://host:port")
-//
-// Returns:
-//   - *http.Transport: A configured transport, or nil if the proxy URL is invalid
 func buildProxyTransport(proxyURL string) *http.Transport {
 	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
 	if errBuild != nil {
@@ -111,4 +93,88 @@ func buildProxyTransport(proxyURL string) *http.Transport {
 		return nil
 	}
 	return transport
+}
+
+func environmentProxyConfigured() bool {
+	for _, key := range environmentProxyKeys {
+		if strings.TrimSpace(os.Getenv(key)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func newEnvironmentProxyTransport() *http.Transport {
+	signature := environmentProxySignature()
+	if cached, ok := environmentProxyTransportCache.Load(signature); ok {
+		return cached.(*http.Transport)
+	}
+
+	proxyFunc := environmentProxyFunc()
+	var transport *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
+		clone := base.Clone()
+		clone.Proxy = proxyFunc
+		transport = clone
+	} else {
+		transport = &http.Transport{Proxy: proxyFunc}
+	}
+	actual, _ := environmentProxyTransportCache.LoadOrStore(signature, transport)
+	return actual.(*http.Transport)
+}
+
+func environmentProxySignature() string {
+	var values []string
+	for _, key := range environmentProxyKeys {
+		values = append(values, key+"="+strings.TrimSpace(os.Getenv(key)))
+	}
+	return strings.Join(values, "|")
+}
+
+func environmentProxyFunc() func(*http.Request) (*url.URL, error) {
+	httpProxy := firstEnvironmentValue("HTTP_PROXY", "http_proxy")
+	httpsProxy := firstEnvironmentValue("HTTPS_PROXY", "https_proxy")
+	allProxy := firstEnvironmentValue("ALL_PROXY", "all_proxy")
+
+	return func(req *http.Request) (*url.URL, error) {
+		if req == nil || req.URL == nil {
+			return nil, nil
+		}
+
+		raw := ""
+		switch strings.ToLower(req.URL.Scheme) {
+		case "https":
+			raw = firstNonEmpty(httpsProxy, allProxy, httpProxy)
+		case "http":
+			raw = firstNonEmpty(httpProxy, allProxy, httpsProxy)
+		default:
+			raw = firstNonEmpty(allProxy, httpsProxy, httpProxy)
+		}
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return nil, nil
+		}
+		if !strings.Contains(raw, "://") {
+			raw = "http://" + raw
+		}
+		return url.Parse(raw)
+	}
+}
+
+func firstEnvironmentValue(keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }

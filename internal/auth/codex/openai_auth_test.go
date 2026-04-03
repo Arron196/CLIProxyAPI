@@ -42,7 +42,7 @@ func TestRefreshTokensWithRetry_NonRetryableOnlyAttemptsOnce(t *testing.T) {
 		},
 	}
 
-	_, err := auth.RefreshTokensWithRetry(context.Background(), "dummy_refresh_token", 3)
+	_, err := auth.RefreshTokensWithRetry(context.Background(), "dummy_refresh_token", "app_EMoamEEZ73f0CkXaXp7hrann", 3)
 	if err == nil {
 		t.Fatalf("expected error for non-retryable refresh failure")
 	}
@@ -73,7 +73,7 @@ func TestRefreshTokensWithRetry_UnauthorizedOnlyAttemptsOnce(t *testing.T) {
 		},
 	}
 
-	_, err := auth.RefreshTokensWithRetry(context.Background(), "dummy_refresh_token", 3)
+	_, err := auth.RefreshTokensWithRetry(context.Background(), "dummy_refresh_token", "", 3)
 	if err == nil {
 		t.Fatalf("expected error for unauthorized refresh failure")
 	}
