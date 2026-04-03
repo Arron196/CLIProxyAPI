@@ -247,12 +247,6 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
-			if bytes.HasPrefix(chunk, []byte("event:")) {
-				_, _ = c.Writer.Write([]byte("\n"))
-			}
-			_, _ = c.Writer.Write(chunk)
-			_, _ = c.Writer.Write([]byte("\n"))
-		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
 			if errMsg == nil {
 				return
@@ -269,7 +263,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 			_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(chunk))
 		},
 		WriteDone: func() {
-			_, _ = c.Writer.Write([]byte("\n"))
+			_, _ = c.Writer.Write([]byte("\n\n"))
 		},
 	})
 }
