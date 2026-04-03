@@ -24,6 +24,7 @@ type usageReporter struct {
 	source      string
 	requestedAt time.Time
 	once        sync.Once
+	publishFn   func(context.Context, usage.Record)
 }
 
 func newUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth) *usageReporter {
@@ -34,6 +35,7 @@ func newUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		requestedAt: time.Now(),
 		apiKey:      apiKey,
 		source:      resolveUsageSource(auth, apiKey),
+		publishFn:   usage.PublishRecord,
 	}
 	if auth != nil {
 		reporter.authID = auth.ID
@@ -87,7 +89,7 @@ func (r *usageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 		return
 	}
 	r.once.Do(func() {
-		usage.PublishRecord(ctx, r.buildRecord(detail, failed))
+		publishUsageRecord(ctx, r.publishFn, r.buildRecord(detail, failed))
 	})
 }
 
@@ -100,8 +102,16 @@ func (r *usageReporter) ensurePublished(ctx context.Context) {
 		return
 	}
 	r.once.Do(func() {
-		usage.PublishRecord(ctx, r.buildRecord(usage.Detail{}, false))
+		publishUsageRecord(ctx, r.publishFn, r.buildRecord(usage.Detail{}, false))
 	})
+}
+
+func publishUsageRecord(ctx context.Context, fn func(context.Context, usage.Record), record usage.Record) {
+	if fn == nil {
+		usage.PublishRecord(ctx, record)
+		return
+	}
+	fn(ctx, record)
 }
 
 func (r *usageReporter) buildRecord(detail usage.Detail, failed bool) usage.Record {

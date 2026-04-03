@@ -65,66 +65,43 @@ func TestUsageReporterBuildRecordIncludesLatency(t *testing.T) {
 	}
 }
 
-type usageCapturePlugin struct {
-	ch chan usage.Record
-}
-
-func (p *usageCapturePlugin) HandleUsage(_ context.Context, record usage.Record) {
-	select {
-	case p.ch <- record:
-	default:
-	}
-}
-
-func awaitUsageRecord(t *testing.T, ch <-chan usage.Record, provider string) usage.Record {
-	t.Helper()
-
-	deadline := time.After(2 * time.Second)
-	for {
-		select {
-		case record := <-ch:
-			if record.Provider == provider {
-				return record
-			}
-		case <-deadline:
-			t.Fatalf("timed out waiting for usage record for provider %q", provider)
-		}
-	}
-}
-
 func TestUsageReporterFinalizePublishesFailureOnError(t *testing.T) {
-	plugin := &usageCapturePlugin{ch: make(chan usage.Record, 8)}
-	usage.RegisterPlugin(plugin)
+	records := make(chan usage.Record, 2)
 
 	reporter := &usageReporter{
 		provider:    "test-finalize-failure",
 		model:       "model",
 		requestedAt: time.Now(),
+		publishFn: func(_ context.Context, record usage.Record) {
+			records <- record
+		},
 	}
 	err := errors.New("boom")
 
 	reporter.finalize(context.Background(), &err)
 
-	record := awaitUsageRecord(t, plugin.ch, reporter.provider)
+	record := <-records
 	if !record.Failed {
 		t.Fatalf("record.Failed = false, want true")
 	}
 }
 
 func TestUsageReporterFinalizePublishesSuccessWithoutError(t *testing.T) {
-	plugin := &usageCapturePlugin{ch: make(chan usage.Record, 8)}
-	usage.RegisterPlugin(plugin)
+	records := make(chan usage.Record, 2)
 
 	reporter := &usageReporter{
 		provider:    "test-finalize-success",
 		model:       "model",
 		requestedAt: time.Now(),
+		publishFn: func(_ context.Context, record usage.Record) {
+			records <- record
+		},
 	}
 	var err error
 
 	reporter.finalize(context.Background(), &err)
 
-	record := awaitUsageRecord(t, plugin.ch, reporter.provider)
+	record := <-records
 	if record.Failed {
 		t.Fatalf("record.Failed = true, want false")
 	}
