@@ -246,6 +246,13 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	}
 }
 
+func websocketClientAddress(c *gin.Context) string {
+	if c == nil || c.Request == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.ClientIP())
+}
+
 func websocketUpgradeHeaders(req *http.Request) http.Header {
 	headers := http.Header{}
 	if req == nil {
@@ -486,13 +493,6 @@ func normalizeResponseTranscriptReplacement(rawJSON []byte, lastRequest []byte) 
 	}
 	normalized, _ = sjson.SetBytes(normalized, "stream", true)
 	return bytes.Clone(normalized)
-}
-
-func websocketClientAddress(c *gin.Context) string {
-	if c == nil || c.Request == nil {
-		return ""
-	}
-	return strings.TrimSpace(c.ClientIP())
 }
 
 func websocketUpstreamSupportsIncrementalInput(attributes map[string]string, metadata map[string]any) bool {
