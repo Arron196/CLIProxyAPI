@@ -362,7 +362,7 @@ func (s *Server) setupRoutes() {
 			},
 		})
 	})
-	s.engine.POST("/v1internal:method", geminiCLIHandlers.CLIHandler)
+	s.engine.POST("/v1internal:method", AuthMiddleware(s.accessManager), geminiCLIHandlers.CLIHandler)
 
 	// OAuth callback endpoints (reuse main server port)
 	// These endpoints receive provider redirects and persist

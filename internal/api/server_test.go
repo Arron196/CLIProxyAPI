@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +19,22 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func stubDefaultTransport(t *testing.T, transport http.RoundTripper) {
+	t.Helper()
+
+	original := http.DefaultTransport
+	http.DefaultTransport = transport
+	t.Cleanup(func() {
+		http.DefaultTransport = original
+	})
+}
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
@@ -132,6 +150,106 @@ func TestAmpProviderModelRoutes(t *testing.T) {
 				t.Fatalf("response body for %s missing %q: %s", tc.path, tc.wantContains, body)
 			}
 		})
+	}
+}
+
+func TestGeminiCLIRouteRequiresAPIKey(t *testing.T) {
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1internal:generateContent", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "203.0.113.7:4567"
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusUnauthorized, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "Missing API key") {
+		t.Fatalf("body = %q, want missing API key error", rr.Body.String())
+	}
+}
+
+func TestGeminiCLIRouteAllowsAuthenticatedNonLocalRequest(t *testing.T) {
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1internal:generateContent", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.RemoteAddr = "203.0.113.7:4567"
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code == http.StatusUnauthorized || rr.Code == http.StatusForbidden {
+		t.Fatalf("status = %d, want request to pass auth and localhost gate; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGeminiCLIPassthroughStripsAuthorizationUsedForProxyAuth(t *testing.T) {
+	server := newTestServer(t)
+
+	var upstreamAuthorization string
+	stubDefaultTransport(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		upstreamAuthorization = req.Header.Get("Authorization")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"status":"ok"}`)),
+			Request:    req,
+		}, nil
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1internal:countTokens", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-key")
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if upstreamAuthorization != "" {
+		t.Fatalf("upstream Authorization = %q, want empty", upstreamAuthorization)
+	}
+}
+
+func TestGeminiCLIPassthroughPreservesUpstreamAuthorizationWhenProxyAuthUsesGoogleAPIKey(t *testing.T) {
+	server := newTestServer(t)
+
+	var (
+		upstreamAuthorization string
+		upstreamGoogleAPIKey  string
+	)
+	stubDefaultTransport(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		upstreamAuthorization = req.Header.Get("Authorization")
+		upstreamGoogleAPIKey = req.Header.Get("X-Goog-Api-Key")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"status":"ok"}`)),
+			Request:    req,
+		}, nil
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1internal:countTokens", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Goog-Api-Key", "test-key")
+	req.Header.Set("Authorization", "Bearer upstream-token")
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if upstreamAuthorization != "Bearer upstream-token" {
+		t.Fatalf("upstream Authorization = %q, want %q", upstreamAuthorization, "Bearer upstream-token")
+	}
+	if upstreamGoogleAPIKey != "" {
+		t.Fatalf("upstream X-Goog-Api-Key = %q, want empty", upstreamGoogleAPIKey)
 	}
 }
 

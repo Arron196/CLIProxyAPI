@@ -47,18 +47,9 @@ func (h *GeminiCLIAPIHandler) Models() []map[string]any {
 }
 
 // CLIHandler handles CLI-specific requests for Gemini API operations.
-// It restricts access to localhost only and routes requests to appropriate internal handlers.
+// Access control is enforced at the router level so authenticated clients can
+// use Gemini CLI-compatible routes through the public proxy.
 func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
-	if !strings.HasPrefix(c.Request.RemoteAddr, "127.0.0.1:") {
-		c.JSON(http.StatusForbidden, handlers.ErrorResponse{
-			Error: handlers.ErrorDetail{
-				Message: "CLI reply only allow local access",
-				Type:    "forbidden",
-			},
-		})
-		return
-	}
-
 	rawJSON, _ := c.GetRawData()
 	requestRawURI := c.Request.URL.Path
 
@@ -78,9 +69,8 @@ func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
 			})
 			return
 		}
-		for key, value := range c.Request.Header {
-			req.Header[key] = value
-		}
+		req.Header = handlers.FilterUpstreamHeaders(c.Request.Header)
+		stripConsumedProxyCredential(req, c)
 
 		httpClient := util.SetProxy(h.Cfg, &http.Client{})
 
@@ -128,6 +118,71 @@ func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
 		_, _ = c.Writer.Write(output)
 		c.Set("API_RESPONSE", output)
 	}
+}
+
+func stripConsumedProxyCredential(req *http.Request, c *gin.Context) {
+	if req == nil || c == nil {
+		return
+	}
+
+	switch accessMetadataSource(c) {
+	case "authorization":
+		req.Header.Del("Authorization")
+	case "x-goog-api-key":
+		req.Header.Del("X-Goog-Api-Key")
+	case "x-api-key":
+		req.Header.Del("X-Api-Key")
+	case "query-key":
+		removeQueryValuesMatching(req, "key", strings.TrimSpace(c.GetString("apiKey")))
+	case "query-auth-token":
+		removeQueryValuesMatching(req, "auth_token", strings.TrimSpace(c.GetString("apiKey")))
+	}
+}
+
+func accessMetadataSource(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	raw, exists := c.Get("accessMetadata")
+	if !exists || raw == nil {
+		return ""
+	}
+	switch typed := raw.(type) {
+	case map[string]string:
+		return strings.TrimSpace(typed["source"])
+	case map[string]any:
+		if source, ok := typed["source"].(string); ok {
+			return strings.TrimSpace(source)
+		}
+	}
+	return ""
+}
+
+func removeQueryValuesMatching(req *http.Request, key string, match string) {
+	if req == nil || req.URL == nil || match == "" {
+		return
+	}
+
+	query := req.URL.Query()
+	values, ok := query[key]
+	if !ok || len(values) == 0 {
+		return
+	}
+
+	kept := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == match {
+			continue
+		}
+		kept = append(kept, value)
+	}
+
+	if len(kept) == 0 {
+		query.Del(key)
+	} else {
+		query[key] = kept
+	}
+	req.URL.RawQuery = query.Encode()
 }
 
 // handleInternalStreamGenerateContent handles streaming content generation requests.
