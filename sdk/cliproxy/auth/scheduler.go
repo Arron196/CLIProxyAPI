@@ -334,12 +334,46 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	}
 
 	cursorKey := strings.Join(normalized, ",") + ":" + modelKey
-	start := 0
-	if len(normalized) > 0 {
-		start = s.mixedCursors[cursorKey] % len(normalized)
+	weights := make([]int, len(normalized))
+	segmentStarts := make([]int, len(normalized))
+	segmentEnds := make([]int, len(normalized))
+	totalWeight := 0
+	for providerIndex, shard := range candidateShards {
+		segmentStarts[providerIndex] = totalWeight
+		if shard != nil {
+			weights[providerIndex] = shard.readyCountAtPriorityLocked(preferWebsocketForProvider(normalized[providerIndex]), bestPriority)
+		}
+		totalWeight += weights[providerIndex]
+		segmentEnds[providerIndex] = totalWeight
 	}
+	if totalWeight == 0 {
+		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+	}
+
+	startSlot := s.mixedCursors[cursorKey] % totalWeight
+	startProviderIndex := -1
+	for providerIndex := range normalized {
+		if weights[providerIndex] == 0 {
+			continue
+		}
+		if startSlot < segmentEnds[providerIndex] {
+			startProviderIndex = providerIndex
+			break
+		}
+	}
+	if startProviderIndex < 0 {
+		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+	}
+
+	slot := startSlot
 	for offset := 0; offset < len(normalized); offset++ {
-		providerIndex := (start + offset) % len(normalized)
+		providerIndex := (startProviderIndex + offset) % len(normalized)
+		if weights[providerIndex] == 0 {
+			continue
+		}
+		if providerIndex != startProviderIndex {
+			slot = segmentStarts[providerIndex]
+		}
 		providerKey := normalized[providerIndex]
 		shard := candidateShards[providerIndex]
 		if shard == nil {
@@ -349,7 +383,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if picked == nil {
 			continue
 		}
-		s.mixedCursors[cursorKey] = providerIndex + 1
+		s.mixedCursors[cursorKey] = slot + 1
 		return picked.Clone(), providerKey, nil
 	}
 	return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
@@ -1295,6 +1329,20 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		return nil
 	}
 	return picked.auth
+}
+
+func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int) int {
+	if m == nil {
+		return 0
+	}
+	bucket := m.readyByPriority[priority]
+	if bucket == nil {
+		return 0
+	}
+	if preferWebsocket && len(bucket.ws.flat) > 0 {
+		return len(bucket.ws.flat)
+	}
+	return len(bucket.all.flat)
 }
 
 func bucketHasMatchingReadyEntry(bucket *readyBucket, preferWebsocket bool, predicate func(*scheduledAuth) bool) bool {

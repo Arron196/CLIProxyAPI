@@ -24,7 +24,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	antigravityclaude "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/antigravity/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -220,6 +222,10 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
+	if from.String() == "claude" {
+		originalPayloadSource = antigravityclaude.StripInvalidSignatureThinkingBlocks(originalPayloadSource)
+		req.Payload = originalPayloadSource
+	}
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
@@ -361,6 +367,10 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
+	}
+	if from.String() == "claude" {
+		originalPayloadSource = antigravityclaude.StripInvalidSignatureThinkingBlocks(originalPayloadSource)
+		req.Payload = originalPayloadSource
 	}
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
@@ -754,6 +764,10 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
+	if from.String() == "claude" {
+		originalPayloadSource = antigravityclaude.StripInvalidSignatureThinkingBlocks(originalPayloadSource)
+		req.Payload = originalPayloadSource
+	}
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
@@ -957,6 +971,14 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	respCtx := context.WithValue(ctx, "alt", opts.Alt)
 
 	// Prepare payload once (doesn't depend on baseURL)
+	originalPayloadSource := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayloadSource = opts.OriginalRequest
+	}
+	if from.String() == "claude" {
+		originalPayloadSource = antigravityclaude.StripInvalidSignatureThinkingBlocks(originalPayloadSource)
+		req.Payload = originalPayloadSource
+	}
 	payload := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
 
 	payload, err := thinking.ApplyThinking(payload, req.Model, from.String(), to.String(), e.Identifier())
@@ -1254,42 +1276,71 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		}
 	}
 	payload = geminiToAntigravity(modelName, payload, projectID)
+	if maxOut := gjson.GetBytes(payload, "request.generationConfig.maxOutputTokens"); maxOut.Exists() && maxOut.Type == gjson.Number {
+		if modelInfo := registry.LookupModelInfo(modelName, "antigravity"); modelInfo != nil && modelInfo.MaxCompletionTokens > 0 {
+			if int(maxOut.Int()) > modelInfo.MaxCompletionTokens {
+				payload, _ = sjson.SetBytes(payload, "request.generationConfig.maxOutputTokens", modelInfo.MaxCompletionTokens)
+			}
+		}
+	}
 	payload, _ = sjson.SetBytes(payload, "model", modelName)
 
 	useAntigravitySchema := strings.Contains(modelName, "claude") || strings.Contains(modelName, "gemini-3-pro") || strings.Contains(modelName, "gemini-3.1-pro")
-	payloadStr := string(payload)
-	paths := make([]string, 0)
-	util.Walk(gjson.Parse(payloadStr), "", "parametersJsonSchema", &paths)
-	for _, p := range paths {
-		payloadStr, _ = util.RenameKey(payloadStr, p, p[:len(p)-len("parametersJsonSchema")]+"parameters")
-	}
+	var (
+		bodyReader io.Reader
+		payloadLog []byte
+	)
+	if antigravityRequestNeedsSchemaSanitization(payload) {
+		payloadStr := string(payload)
+		paths := make([]string, 0)
+		util.Walk(gjson.Parse(payloadStr), "", "parametersJsonSchema", &paths)
+		for _, p := range paths {
+			payloadStr, _ = util.RenameKey(payloadStr, p, p[:len(p)-len("parametersJsonSchema")]+"parameters")
+		}
 
-	if useAntigravitySchema {
-		payloadStr = util.CleanJSONSchemaForAntigravity(payloadStr)
+		if useAntigravitySchema {
+			payloadStr = util.CleanJSONSchemaForAntigravity(payloadStr)
+		} else {
+			payloadStr = util.CleanJSONSchemaForGemini(payloadStr)
+		}
+
+		// if useAntigravitySchema {
+		// 	systemInstructionPartsResult := gjson.Get(payloadStr, "request.systemInstruction.parts")
+		// 	payloadStr, _ = sjson.Set(payloadStr, "request.systemInstruction.role", "user")
+		// 	payloadStr, _ = sjson.Set(payloadStr, "request.systemInstruction.parts.0.text", systemInstruction)
+		// 	payloadStr, _ = sjson.Set(payloadStr, "request.systemInstruction.parts.1.text", fmt.Sprintf("Please ignore following [ignore]%s[/ignore]", systemInstruction))
+
+		// 	if systemInstructionPartsResult.Exists() && systemInstructionPartsResult.IsArray() {
+		// 		for _, partResult := range systemInstructionPartsResult.Array() {
+		// 			payloadStr, _ = sjson.SetRaw(payloadStr, "request.systemInstruction.parts.-1", partResult.Raw)
+		// 		}
+		// 	}
+		// }
+
+		if strings.Contains(modelName, "claude") {
+			payloadStr, _ = sjson.Set(payloadStr, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+		} else {
+			payloadStr, _ = sjson.Delete(payloadStr, "request.generationConfig.maxOutputTokens")
+		}
+
+		bodyReader = strings.NewReader(payloadStr)
+		if e.cfg != nil && e.cfg.RequestLog {
+			payloadLog = []byte(payloadStr)
+		}
 	} else {
-		payloadStr = util.CleanJSONSchemaForGemini(payloadStr)
+		if strings.Contains(modelName, "claude") {
+			payload, _ = sjson.SetBytes(payload, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+		} else {
+			payload, _ = sjson.DeleteBytes(payload, "request.generationConfig.maxOutputTokens")
+		}
+
+		bodyReader = bytes.NewReader(payload)
+		if e.cfg != nil && e.cfg.RequestLog {
+			payloadLog = append([]byte(nil), payload...)
+		}
 	}
 
-	// if useAntigravitySchema {
-	// 	systemInstructionPartsResult := gjson.Get(payloadStr, "request.systemInstruction.parts")
-	// 	payloadStr, _ = sjson.Set(payloadStr, "request.systemInstruction.role", "user")
-	// 	payloadStr, _ = sjson.Set(payloadStr, "request.systemInstruction.parts.0.text", systemInstruction)
-	// 	payloadStr, _ = sjson.Set(payloadStr, "request.systemInstruction.parts.1.text", fmt.Sprintf("Please ignore following [ignore]%s[/ignore]", systemInstruction))
-
-	// 	if systemInstructionPartsResult.Exists() && systemInstructionPartsResult.IsArray() {
-	// 		for _, partResult := range systemInstructionPartsResult.Array() {
-	// 			payloadStr, _ = sjson.SetRaw(payloadStr, "request.systemInstruction.parts.-1", partResult.Raw)
-	// 		}
-	// 	}
-	// }
-
-	if strings.Contains(modelName, "claude") {
-		payloadStr, _ = sjson.Set(payloadStr, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
-	} else {
-		payloadStr, _ = sjson.Delete(payloadStr, "request.generationConfig.maxOutputTokens")
-	}
-
-	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), strings.NewReader(payloadStr))
+	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), bodyReader)
 	if errReq != nil {
 		return nil, errReq
 	}
@@ -1307,10 +1358,6 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	var payloadLog []byte
-	if e.cfg != nil && e.cfg.RequestLog {
-		payloadLog = []byte(payloadStr)
-	}
 	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
 		URL:       requestURL.String(),
 		Method:    http.MethodPost,
@@ -1324,6 +1371,19 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 	})
 
 	return httpReq, nil
+}
+
+func antigravityRequestNeedsSchemaSanitization(payload []byte) bool {
+	if gjson.GetBytes(payload, "request.tools.0").Exists() {
+		return true
+	}
+	if gjson.GetBytes(payload, "request.generationConfig.responseJsonSchema").Exists() {
+		return true
+	}
+	if gjson.GetBytes(payload, "request.generationConfig.responseSchema").Exists() {
+		return true
+	}
+	return false
 }
 
 func tokenExpiry(metadata map[string]any) time.Time {

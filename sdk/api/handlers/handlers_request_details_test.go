@@ -96,6 +96,12 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 			wantModel:     "claude-sonnet-4-5(auto)",
 			wantErr:       false,
 		},
+		{
+			name:       "gpt image rejected on text routes",
+			inputModel: "gpt-image-2",
+			wantModel:  "",
+			wantErr:    true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -105,6 +111,9 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 				t.Fatalf("getRequestDetails() error = %v, wantErr %v", errMsg, tt.wantErr)
 			}
 			if errMsg != nil {
+				if tt.inputModel == "gpt-image-2" && errMsg.StatusCode != 503 {
+					t.Fatalf("getRequestDetails() status = %d, want %d", errMsg.StatusCode, 503)
+				}
 				return
 			}
 			if !reflect.DeepEqual(providers, tt.wantProviders) {

@@ -429,6 +429,29 @@ func TestNormalizeResponsesWebsocketRequestTreatsTranscriptReplacementAsReset(t 
 	}
 }
 
+func TestNormalizeResponsesWebsocketRequestTreatsCustomToolTranscriptReplacementAsReset(t *testing.T) {
+	lastRequest := []byte(`{"model":"test-model","stream":true,"input":[{"type":"message","id":"msg-1"},{"type":"custom_tool_call","id":"ctc-1","call_id":"call-1"},{"type":"custom_tool_call_output","id":"tool-out-1","call_id":"call-1"},{"type":"message","id":"assistant-1","role":"assistant"}]}`)
+	lastResponseOutput := []byte(`[
+		{"type":"message","id":"assistant-1","role":"assistant"}
+	]`)
+	raw := []byte(`{"type":"response.create","input":[{"type":"custom_tool_call","id":"ctc-compact","call_id":"call-1","name":"apply_patch"},{"type":"message","id":"msg-2"}]}`)
+
+	normalized, next, errMsg := normalizeResponsesWebsocketRequest(raw, lastRequest, lastResponseOutput)
+	if errMsg != nil {
+		t.Fatalf("unexpected error: %v", errMsg.Error)
+	}
+	items := gjson.GetBytes(normalized, "input").Array()
+	if len(items) != 2 {
+		t.Fatalf("replacement input len = %d, want 2: %s", len(items), normalized)
+	}
+	if items[0].Get("id").String() != "ctc-compact" || items[1].Get("id").String() != "msg-2" {
+		t.Fatalf("replacement transcript was not preserved as-is: %s", normalized)
+	}
+	if !bytes.Equal(next, normalized) {
+		t.Fatalf("next request snapshot should match replacement request")
+	}
+}
+
 func TestNormalizeResponsesWebsocketRequestKeepsDeveloperMessagesIncremental(t *testing.T) {
 	lastRequest := []byte(`{"model":"test-model","stream":true,"input":[{"type":"message","id":"msg-1","role":"user"}]}`)
 	lastResponseOutput := []byte(`[
@@ -492,6 +515,29 @@ func TestNormalizeResponsesWebsocketRequestDropsDuplicateFunctionCallsByCallID(t
 		t.Fatalf("merged input len = %d, want 3: %s", len(items), normalized)
 	}
 	if items[0].Get("id").String() != "fc-1" ||
+		items[1].Get("id").String() != "tool-out-1" ||
+		items[2].Get("id").String() != "msg-2" {
+		t.Fatalf("unexpected merged input order: %s", normalized)
+	}
+}
+
+func TestNormalizeResponsesWebsocketRequestDropsDuplicateCustomToolCallsByCallID(t *testing.T) {
+	lastRequest := []byte(`{"model":"test-model","stream":true,"input":[{"type":"custom_tool_call","id":"ctc-1","call_id":"call-1"},{"type":"custom_tool_call_output","id":"tool-out-1","call_id":"call-1"}]}`)
+	lastResponseOutput := []byte(`[
+		{"type":"custom_tool_call","id":"ctc-1","call_id":"call-1","name":"apply_patch"}
+	]`)
+	raw := []byte(`{"type":"response.create","input":[{"type":"message","id":"msg-2"}]}`)
+
+	normalized, _, errMsg := normalizeResponsesWebsocketRequest(raw, lastRequest, lastResponseOutput)
+	if errMsg != nil {
+		t.Fatalf("unexpected error: %v", errMsg.Error)
+	}
+
+	items := gjson.GetBytes(normalized, "input").Array()
+	if len(items) != 3 {
+		t.Fatalf("merged input len = %d, want 3: %s", len(items), normalized)
+	}
+	if items[0].Get("id").String() != "ctc-1" ||
 		items[1].Get("id").String() != "tool-out-1" ||
 		items[2].Get("id").String() != "msg-2" {
 		t.Fatalf("unexpected merged input order: %s", normalized)
@@ -697,6 +743,76 @@ func TestRepairResponsesWebsocketToolCallsDropsOrphanOutputWhenCallMissing(t *te
 	}
 }
 
+func TestRepairResponsesWebsocketToolCallsInsertsCachedCustomToolOutput(t *testing.T) {
+	state := newWebsocketToolPairState()
+
+	warmed := repairResponsesWebsocketToolCalls(state, []byte(`{"previous_response_id":"resp-1","input":[{"type":"custom_tool_call_output","call_id":"call-1","output":"ok"}]}`))
+	if gjson.GetBytes(warmed, "input.0.call_id").String() != "call-1" {
+		t.Fatalf("expected warmup output to remain")
+	}
+
+	repaired := repairResponsesWebsocketToolCalls(state, []byte(`{"input":[{"type":"custom_tool_call","call_id":"call-1","name":"apply_patch"},{"type":"message","id":"msg-1"}]}`))
+	input := gjson.GetBytes(repaired, "input").Array()
+	if len(input) != 3 {
+		t.Fatalf("repaired input len = %d, want 3", len(input))
+	}
+	if input[0].Get("type").String() != "custom_tool_call" || input[0].Get("call_id").String() != "call-1" {
+		t.Fatalf("unexpected first item: %s", input[0].Raw)
+	}
+	if input[1].Get("type").String() != "custom_tool_call_output" || input[1].Get("call_id").String() != "call-1" {
+		t.Fatalf("missing inserted output: %s", input[1].Raw)
+	}
+	if input[2].Get("type").String() != "message" || input[2].Get("id").String() != "msg-1" {
+		t.Fatalf("unexpected trailing item: %s", input[2].Raw)
+	}
+}
+
+func TestRepairResponsesWebsocketToolCallsDropsOrphanCustomToolCall(t *testing.T) {
+	state := newWebsocketToolPairState()
+
+	repaired := repairResponsesWebsocketToolCalls(state, []byte(`{"input":[{"type":"custom_tool_call","call_id":"call-1","name":"apply_patch"},{"type":"message","id":"msg-1"}]}`))
+	input := gjson.GetBytes(repaired, "input").Array()
+	if len(input) != 1 {
+		t.Fatalf("repaired input len = %d, want 1", len(input))
+	}
+	if input[0].Get("type").String() != "message" || input[0].Get("id").String() != "msg-1" {
+		t.Fatalf("unexpected remaining item: %s", input[0].Raw)
+	}
+}
+
+func TestRepairResponsesWebsocketToolCallsInsertsCachedCustomToolCallForOrphanOutput(t *testing.T) {
+	state := newWebsocketToolPairState()
+	recordResponsesWebsocketToolCallsFromPayload(state, []byte(`{"type":"response.completed","response":{"id":"resp-1","output":[{"type":"custom_tool_call","id":"fc-1","call_id":"call-1","name":"apply_patch","arguments":"{}"}]}}`))
+
+	repaired := repairResponsesWebsocketToolCalls(state, []byte(`{"input":[{"type":"custom_tool_call_output","call_id":"call-1","output":"ok"},{"type":"message","id":"msg-1"}]}`))
+	input := gjson.GetBytes(repaired, "input").Array()
+	if len(input) != 3 {
+		t.Fatalf("repaired input len = %d, want 3", len(input))
+	}
+	if input[0].Get("type").String() != "custom_tool_call" || input[0].Get("call_id").String() != "call-1" {
+		t.Fatalf("missing inserted call: %s", input[0].Raw)
+	}
+	if input[1].Get("type").String() != "custom_tool_call_output" || input[1].Get("call_id").String() != "call-1" {
+		t.Fatalf("unexpected output item: %s", input[1].Raw)
+	}
+	if input[2].Get("type").String() != "message" || input[2].Get("id").String() != "msg-1" {
+		t.Fatalf("unexpected trailing item: %s", input[2].Raw)
+	}
+}
+
+func TestRepairResponsesWebsocketToolCallsDropsOrphanCustomToolOutputWhenCallMissing(t *testing.T) {
+	state := newWebsocketToolPairState()
+
+	repaired := repairResponsesWebsocketToolCalls(state, []byte(`{"input":[{"type":"custom_tool_call_output","call_id":"call-1","output":"ok"},{"type":"message","id":"msg-1"}]}`))
+	input := gjson.GetBytes(repaired, "input").Array()
+	if len(input) != 1 {
+		t.Fatalf("repaired input len = %d, want 1", len(input))
+	}
+	if input[0].Get("type").String() != "message" || input[0].Get("id").String() != "msg-1" {
+		t.Fatalf("unexpected remaining item: %s", input[0].Raw)
+	}
+}
+
 func TestRecordResponsesWebsocketToolCallsFromPayload(t *testing.T) {
 	state := newWebsocketToolPairState()
 
@@ -723,6 +839,12 @@ func TestShouldRepairResponsesWebsocketToolCalls(t *testing.T) {
 	}
 	if !shouldRepairResponsesWebsocketToolCalls(`[{"type":"function_call_output","call_id":"call-1"}]`) {
 		t.Fatal("expected function_call_output input to require repair")
+	}
+	if !shouldRepairResponsesWebsocketToolCalls(`[{"type":"custom_tool_call","call_id":"call-1"}]`) {
+		t.Fatal("expected custom_tool_call input to require repair")
+	}
+	if !shouldRepairResponsesWebsocketToolCalls(`[{"type":"custom_tool_call_output","call_id":"call-1"}]`) {
+		t.Fatal("expected custom_tool_call_output input to require repair")
 	}
 }
 

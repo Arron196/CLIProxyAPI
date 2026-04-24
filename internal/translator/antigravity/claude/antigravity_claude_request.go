@@ -51,6 +51,9 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 			systemTypePromptResult := systemPromptResult.Get("type")
 			if systemTypePromptResult.Type == gjson.String && systemTypePromptResult.String() == "text" {
 				systemPrompt := systemPromptResult.Get("text").String()
+				if strings.HasPrefix(systemPrompt, "x-anthropic-billing-header:") {
+					continue
+				}
 				partJSON := `{}`
 				if systemPrompt != "" {
 					partJSON, _ = sjson.Set(partJSON, "text", systemPrompt)

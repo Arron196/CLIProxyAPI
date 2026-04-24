@@ -600,3 +600,99 @@ func TestManager_MarkResult_RespectsAuthDisableCoolingOverride(t *testing.T) {
 		t.Fatalf("expected NextRetryAfter to be zero when disable_cooling=true, got %v", state.NextRetryAfter)
 	}
 }
+
+func TestManager_MarkResult_RequestScopedNotFoundDoesNotCooldownAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+
+	auth := &Auth{
+		ID:       "auth-1",
+		Provider: "claude",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "test-model"
+	m.MarkResult(context.Background(), Result{
+		AuthID:   "auth-1",
+		Provider: "claude",
+		Model:    model,
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusNotFound,
+			Message:    "Item with id 'rs_0b5f3eb6f51f175c0169ca74e4a85881998539920821603a74' not found. Items are not persisted when `store` is set to false. Try again with `store` set to true, or remove this item from your input.",
+		},
+	})
+
+	updated, ok := m.GetByID("auth-1")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	if updated.Unavailable {
+		t.Fatalf("expected request-scoped 404 to keep auth available")
+	}
+	if !updated.NextRetryAfter.IsZero() {
+		t.Fatalf("expected request-scoped 404 to keep auth cooldown unset, got %v", updated.NextRetryAfter)
+	}
+	if state := updated.ModelStates[model]; state != nil {
+		t.Fatalf("expected request-scoped 404 to avoid model cooldown state, got %#v", state)
+	}
+}
+
+func TestManager_RequestScopedNotFoundStopsRetryWithoutSuspendingAuth(t *testing.T) {
+	model := "test-model-request-scoped-not-found"
+	executor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"bad-auth": &Error{
+				HTTPStatus: http.StatusNotFound,
+				Message:    "Item with id 'rs_0b5f3eb6f51f175c0169ca74e4a85881998539920821603a74' not found. Items are not persisted when `store` is set to false. Try again with `store` set to true, or remove this item from your input.",
+			},
+		},
+	}
+
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(1, 0, 1, 1)
+	m.RegisterExecutor(executor)
+
+	reg := registry.GetGlobalRegistry()
+	badAuth := &Auth{ID: "bad-auth", Provider: "claude"}
+	if _, errRegister := m.Register(context.Background(), badAuth); errRegister != nil {
+		t.Fatalf("register bad auth: %v", errRegister)
+	}
+	reg.RegisterClient(badAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+	})
+
+	_, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("expected request-scoped not-found error")
+	}
+	errResult, ok := errExecute.(*Error)
+	if !ok {
+		t.Fatalf("expected *Error, got %T", errExecute)
+	}
+	if errResult.HTTPStatus != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", errResult.HTTPStatus, http.StatusNotFound)
+	}
+
+	got := executor.ExecuteCalls()
+	if len(got) != 1 || got[0] != badAuth.ID {
+		t.Fatalf("execute calls = %v, want [%s]", got, badAuth.ID)
+	}
+
+	updatedBad, ok := m.GetByID(badAuth.ID)
+	if !ok || updatedBad == nil {
+		t.Fatalf("expected bad auth to remain registered")
+	}
+	if updatedBad.Unavailable {
+		t.Fatalf("expected request-scoped 404 to keep bad auth available")
+	}
+	if !updatedBad.NextRetryAfter.IsZero() {
+		t.Fatalf("expected request-scoped 404 to keep bad auth cooldown unset, got %v", updatedBad.NextRetryAfter)
+	}
+	if state := updatedBad.ModelStates[model]; state != nil {
+		t.Fatalf("expected request-scoped 404 to avoid bad auth model cooldown state, got %#v", state)
+	}
+}

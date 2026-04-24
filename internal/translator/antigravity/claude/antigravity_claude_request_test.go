@@ -54,6 +54,77 @@ func TestConvertClaudeRequestToAntigravity_BasicStructure(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeRequestToAntigravity_StripsBillingHeaderFromSystemInstruction(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "claude-3-5-sonnet-20240620",
+		"messages": [
+			{"role": "user", "content": [{"type": "text", "text": "Hello"}]}
+		],
+		"system": [
+			{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.63.abc; cc_entrypoint=cli; cch=12345;"},
+			{"type": "text", "text": "You are helpful"}
+		]
+	}`)
+
+	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	outputStr := string(output)
+
+	parts := gjson.Get(outputStr, "request.systemInstruction.parts").Array()
+	if len(parts) != 1 {
+		t.Fatalf("systemInstruction.parts length = %d, want %d", len(parts), 1)
+	}
+	if got := parts[0].Get("text").String(); got != "You are helpful" {
+		t.Fatalf("systemInstruction.parts[0].text = %q, want %q", got, "You are helpful")
+	}
+}
+
+func TestStripInvalidSignatureThinkingBlocks_StripsEmptyAndNonClaudeSignatures(t *testing.T) {
+	input := []byte(`{
+		"messages": [{
+			"role": "assistant",
+			"content": [
+				{"type":"thinking","thinking":"empty","signature":""},
+				{"type":"thinking","thinking":"hex","signature":"d5cb9cd0823142109f451861"},
+				{"type":"thinking","thinking":"valid","signature":"Eabc123"},
+				{"type":"text","text":"kept"}
+			]
+		}]
+	}`)
+
+	out := StripInvalidSignatureThinkingBlocks(input)
+	parts := gjson.GetBytes(out, "messages.0.content").Array()
+	if len(parts) != 2 {
+		t.Fatalf("content length = %d, want %d", len(parts), 2)
+	}
+	if got := parts[0].Get("thinking").String(); got != "valid" {
+		t.Fatalf("first kept thinking = %q, want %q", got, "valid")
+	}
+	if got := parts[1].Get("text").String(); got != "kept" {
+		t.Fatalf("second kept text = %q, want %q", got, "kept")
+	}
+}
+
+func TestStripInvalidSignatureThinkingBlocks_AcceptsCachePrefixedClaudeSignature(t *testing.T) {
+	input := []byte(`{
+		"messages": [{
+			"role": "assistant",
+			"content": [
+				{"type":"thinking","thinking":"valid","signature":"claude#Rabc123"},
+				{"type":"text","text":"kept"}
+			]
+		}]
+	}`)
+
+	out := StripInvalidSignatureThinkingBlocks(input)
+	parts := gjson.GetBytes(out, "messages.0.content").Array()
+	if len(parts) != 2 {
+		t.Fatalf("content length = %d, want %d", len(parts), 2)
+	}
+	if got := parts[0].Get("signature").String(); got != "claude#Rabc123" {
+		t.Fatalf("kept signature = %q, want %q", got, "claude#Rabc123")
+	}
+}
+
 func TestConvertClaudeRequestToAntigravity_RoleMapping(t *testing.T) {
 	inputJSON := []byte(`{
 		"model": "claude-3-5-sonnet-20240620",

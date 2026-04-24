@@ -1807,12 +1807,12 @@ func (s *Service) Run(ctx context.Context) error {
 
 	var watcherWrapper *WatcherWrapper
 	reloadCallback := func(newCfg *config.Config) {
-		previousStrategy := ""
+		previousRouting := routingSelectorState{strategy: "round-robin"}
 		previousUsageEnabled := false
 		previousUsagePersistenceInterval := time.Duration(0)
 		s.cfgMu.RLock()
 		if s.cfg != nil {
-			previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
+			previousRouting = routingStateFromConfig(s.cfg)
 			previousUsageEnabled = s.cfg.UsageStatisticsEnabled
 			previousUsagePersistenceInterval = usagePersistenceIntervalForConfig(s.cfg)
 		}
@@ -1827,26 +1827,9 @@ func (s *Service) Run(ctx context.Context) error {
 			return
 		}
 
-		nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
-		normalizeStrategy := func(strategy string) string {
-			switch strategy {
-			case "fill-first", "fillfirst", "ff":
-				return "fill-first"
-			default:
-				return "round-robin"
-			}
-		}
-		previousStrategy = normalizeStrategy(previousStrategy)
-		nextStrategy = normalizeStrategy(nextStrategy)
-		if s.coreManager != nil && previousStrategy != nextStrategy {
-			var selector coreauth.Selector
-			switch nextStrategy {
-			case "fill-first":
-				selector = &coreauth.FillFirstSelector{}
-			default:
-				selector = &coreauth.RoundRobinSelector{}
-			}
-			s.coreManager.SetSelector(selector)
+		nextRouting := routingStateFromConfig(newCfg)
+		if s.coreManager != nil && previousRouting != nextRouting {
+			s.coreManager.SetSelector(selectorFromRoutingConfig(newCfg))
 		}
 
 		s.applyRetryConfig(newCfg)
@@ -1927,6 +1910,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 		if s.coreManager != nil {
 			s.coreManager.StopAutoRefresh()
+			s.coreManager.StopSelector()
 		}
 		if s.maintenanceCancel != nil {
 			s.maintenanceCancel()

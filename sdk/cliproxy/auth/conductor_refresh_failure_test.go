@@ -149,3 +149,41 @@ func TestManagerRefreshAuth_DoesNotMarkTransientRefreshStatusForMaintenance(t *t
 		t.Fatal("expected transient refresh failure to avoid blocking scheduler")
 	}
 }
+
+func TestManagerRefreshAuth_BacksOffWhenRefreshIsIneffective(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(refreshFailureTestExecutor{provider: "codex"})
+
+	auth := &Auth{
+		ID:       "refresh-ineffective",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"email":                    "user@example.com",
+			"refresh_token":            "refresh-token",
+			"expired":                  time.Now().Add(-5 * time.Minute).Format(time.RFC3339),
+			"refresh_interval_seconds": 60,
+		},
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	started := time.Now()
+	manager.refreshAuth(ctx, auth.ID)
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth %q to remain registered", auth.ID)
+	}
+	if updated.NextRefreshAfter.IsZero() {
+		t.Fatal("expected ineffective refresh to schedule NextRefreshAfter backoff")
+	}
+	if !updated.NextRefreshAfter.After(started) {
+		t.Fatalf("expected NextRefreshAfter after %v, got %v", started, updated.NextRefreshAfter)
+	}
+	if updated.NextRefreshAfter.Sub(started) > refreshIneffectiveBackoff+5*time.Second {
+		t.Fatalf("expected ineffective refresh backoff near %v, got %v", refreshIneffectiveBackoff, updated.NextRefreshAfter.Sub(started))
+	}
+}

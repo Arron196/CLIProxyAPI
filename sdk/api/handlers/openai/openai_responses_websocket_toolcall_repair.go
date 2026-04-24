@@ -228,7 +228,7 @@ func shouldRepairResponsesWebsocketToolCalls(inputRaw string) bool {
 	if inputRaw == "" {
 		return false
 	}
-	return strings.Contains(inputRaw, "function_call")
+	return strings.Contains(inputRaw, "function_call") || strings.Contains(inputRaw, "custom_tool_call")
 }
 
 func repairResponsesToolCallsArray(state *websocketToolPairState, rawArray string, allowOrphanOutputs bool) (string, error) {
@@ -253,11 +253,11 @@ func repairResponsesToolCallsArray(state *websocketToolPairState, rawArray strin
 			continue
 		}
 		switch strings.TrimSpace(gjson.GetBytes(item, "type").String()) {
-		case "function_call":
+		case "function_call", "custom_tool_call":
 			if _, exists := callPresent[callID]; !exists {
 				callPresent[callID] = append(json.RawMessage(nil), item...)
 			}
-		case "function_call_output":
+		case "function_call_output", "custom_tool_call_output":
 			if _, exists := outputPresent[callID]; !exists {
 				outputPresent[callID] = append(json.RawMessage(nil), item...)
 			}
@@ -275,7 +275,7 @@ func repairResponsesToolCallsArray(state *websocketToolPairState, rawArray strin
 		itemType := strings.TrimSpace(gjson.GetBytes(item, "type").String())
 		callID := strings.TrimSpace(gjson.GetBytes(item, "call_id").String())
 		switch itemType {
-		case "function_call":
+		case "function_call", "custom_tool_call":
 			if callID == "" {
 				continue
 			}
@@ -292,7 +292,7 @@ func repairResponsesToolCallsArray(state *websocketToolPairState, rawArray strin
 				filtered = append(filtered, cachedOutput)
 				insertedOutputs[callID] = struct{}{}
 			}
-		case "function_call_output":
+		case "function_call_output", "custom_tool_call_output":
 			if callID == "" {
 				continue
 			}
@@ -325,9 +325,9 @@ func repairResponsesToolCallsArray(state *websocketToolPairState, rawArray strin
 			continue
 		}
 		switch strings.TrimSpace(gjson.GetBytes(item, "type").String()) {
-		case "function_call":
+		case "function_call", "custom_tool_call":
 			state.recordCall(callID, item)
-		case "function_call_output":
+		case "function_call_output", "custom_tool_call_output":
 			state.recordOutput(callID, item)
 		}
 	}
@@ -352,7 +352,9 @@ func recordResponsesWebsocketToolCallsFromPayload(state *websocketToolPairState,
 			return
 		}
 		for _, item := range output.Array() {
-			if strings.TrimSpace(item.Get("type").String()) != "function_call" {
+			switch strings.TrimSpace(item.Get("type").String()) {
+			case "function_call", "custom_tool_call":
+			default:
 				continue
 			}
 			callID := strings.TrimSpace(item.Get("call_id").String())
@@ -366,7 +368,9 @@ func recordResponsesWebsocketToolCallsFromPayload(state *websocketToolPairState,
 		if !item.Exists() || !item.IsObject() {
 			return
 		}
-		if strings.TrimSpace(item.Get("type").String()) != "function_call" {
+		switch strings.TrimSpace(item.Get("type").String()) {
+		case "function_call", "custom_tool_call":
+		default:
 			return
 		}
 		callID := strings.TrimSpace(item.Get("call_id").String())
