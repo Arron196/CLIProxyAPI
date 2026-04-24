@@ -73,6 +73,10 @@ type Config struct {
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
+	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
+	// When <= 0, the default worker count is used.
+	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`
+
 	// RequestRetry defines the retry times when the request failed.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
 	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
@@ -235,6 +239,12 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+	// SessionAffinity enables sticky routing for requests that can derive a stable session identifier.
+	SessionAffinity bool `yaml:"session-affinity,omitempty" json:"session-affinity,omitempty"`
+	// SessionAffinityTTL controls how long inactive session bindings remain cached.
+	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
+	// ClaudeCodeSessionAffinity is a deprecated alias for SessionAffinity.
+	ClaudeCodeSessionAffinity bool `yaml:"claude-code-session-affinity,omitempty" json:"claude-code-session-affinity,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

@@ -786,6 +786,127 @@ func TestStripClaudeToolPrefixFromStreamLine_WithToolReference(t *testing.T) {
 	}
 }
 
+func TestRemapOAuthToolNames_PreservesRenamesWhenFilteringTools(t *testing.T) {
+	body := []byte(`{
+		"tools": [
+			{"name":"bash"},
+			{"name":"question"},
+			{"name":"read"},
+			{"type":"web_search_20250305","name":"web_search"}
+		],
+		"tool_choice": {"type":"tool","name":"bash"},
+		"messages": [{
+			"role":"assistant",
+			"content":[
+				{"type":"tool_use","name":"bash","id":"t1","input":{}},
+				{"type":"tool_reference","tool_name":"read"}
+			]
+		}]
+	}`)
+
+	out := remapOAuthToolNames(body)
+
+	if got := gjson.GetBytes(out, "tools.#").Int(); got != 4 {
+		t.Fatalf("tools count = %d, want %d", got, 4)
+	}
+	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "Bash" {
+		t.Fatalf("tools.0.name = %q, want %q", got, "Bash")
+	}
+	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "Question" {
+		t.Fatalf("tools.1.name = %q, want %q", got, "Question")
+	}
+	if got := gjson.GetBytes(out, "tools.2.name").String(); got != "Read" {
+		t.Fatalf("tools.2.name = %q, want %q", got, "Read")
+	}
+	if got := gjson.GetBytes(out, "tools.3.name").String(); got != "web_search" {
+		t.Fatalf("tools.3.name = %q, want %q", got, "web_search")
+	}
+	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != "Bash" {
+		t.Fatalf("tool_choice.name = %q, want %q", got, "Bash")
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != "Bash" {
+		t.Fatalf("messages.0.content.0.name = %q, want %q", got, "Bash")
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.1.tool_name").String(); got != "Read" {
+		t.Fatalf("messages.0.content.1.tool_name = %q, want %q", got, "Read")
+	}
+}
+
+func TestRemapOAuthToolNames_MapsQuestionToolChoiceInsteadOfRemoving(t *testing.T) {
+	body := []byte(`{
+		"tools": [{"name":"question"},{"name":"bash"}],
+		"tool_choice":{"type":"tool","name":"question"}
+	}`)
+
+	out := remapOAuthToolNames(body)
+
+	if !gjson.GetBytes(out, "tool_choice").Exists() {
+		t.Fatalf("tool_choice should be preserved for mapped tool: %s", string(out))
+	}
+	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != "Question" {
+		t.Fatalf("tool_choice.name = %q, want %q", got, "Question")
+	}
+	if got := gjson.GetBytes(out, "tools.#").Int(); got != 2 {
+		t.Fatalf("tools count = %d, want %d", got, 2)
+	}
+	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "Question" {
+		t.Fatalf("tools.0.name = %q, want %q", got, "Question")
+	}
+	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "Bash" {
+		t.Fatalf("tools.1.name = %q, want %q", got, "Bash")
+	}
+}
+
+func TestRemapOAuthToolNames_WithoutToolsStillRewritesMessageReferences(t *testing.T) {
+	body := []byte(`{
+		"tool_choice":{"type":"tool","name":"skill"},
+		"messages":[{
+			"role":"assistant",
+			"content":[
+				{"type":"tool_use","name":"question","id":"t1","input":{}},
+				{"type":"tool_reference","tool_name":"skill"}
+			]
+		}]
+	}`)
+
+	out := remapOAuthToolNames(body)
+
+	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != "Skill" {
+		t.Fatalf("tool_choice.name = %q, want %q", got, "Skill")
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != "Question" {
+		t.Fatalf("messages.0.content.0.name = %q, want %q", got, "Question")
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.1.tool_name").String(); got != "Skill" {
+		t.Fatalf("messages.0.content.1.tool_name = %q, want %q", got, "Skill")
+	}
+}
+
+func TestReverseRemapOAuthToolNames(t *testing.T) {
+	input := []byte(`{"content":[{"type":"tool_use","name":"Bash"},{"type":"tool_reference","tool_name":"Read"}]}`)
+	out := reverseRemapOAuthToolNames(input)
+
+	if got := gjson.GetBytes(out, "content.0.name").String(); got != "bash" {
+		t.Fatalf("content.0.name = %q, want %q", got, "bash")
+	}
+	if got := gjson.GetBytes(out, "content.1.tool_name").String(); got != "read" {
+		t.Fatalf("content.1.tool_name = %q, want %q", got, "read")
+	}
+}
+
+func TestReverseRemapOAuthToolNamesFromStreamLine(t *testing.T) {
+	line := []byte(`data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"TodoWrite","id":"t1"},"index":0}`)
+	out := reverseRemapOAuthToolNamesFromStreamLine(line)
+
+	payload := bytes.TrimSpace(out)
+	if bytes.HasPrefix(payload, []byte("data:")) {
+		payload = bytes.TrimSpace(payload[len("data:"):])
+	}
+	if got := gjson.GetBytes(payload, "content_block.name").String(); got != "todowrite" {
+		t.Fatalf("content_block.name = %q, want %q", got, "todowrite")
+	}
+}
+
 func TestApplyClaudeToolPrefix_NestedToolReference(t *testing.T) {
 	input := []byte(`{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":[{"type":"tool_reference","tool_name":"mcp__nia__manage_resource"}]}]}]}`)
 	out := applyClaudeToolPrefix(input, "proxy_")
@@ -1646,5 +1767,74 @@ func TestCheckSystemInstructionsWithMode_StringWithSpecialChars(t *testing.T) {
 	}
 	if blocks[2].Get("text").String() != `Use <xml> tags & "quotes" in output.` {
 		t.Fatalf("blocks[2] text mangled, got %q", blocks[2].Get("text").String())
+	}
+}
+
+func TestCheckSystemInstructionsWithOAuthMode_MovesSystemPromptIntoFirstUserMessage(t *testing.T) {
+	payload := []byte(`{"system":"You are OpenCode.\n# Task Management\nIgnore this section.","messages":[{"role":"user","content":"hi"}]}`)
+
+	out := checkSystemInstructionsWithOAuthMode(payload, false, true)
+
+	blocks := gjson.GetBytes(out, "system").Array()
+	if len(blocks) != 2 {
+		t.Fatalf("expected 2 system blocks in oauth mode, got %d", len(blocks))
+	}
+	userContent := gjson.GetBytes(out, "messages.0.content").String()
+	if !strings.Contains(userContent, "<system-reminder>") {
+		t.Fatalf("first user message missing system reminder: %q", userContent)
+	}
+	if !strings.Contains(userContent, "Use the available tools when needed") {
+		t.Fatalf("first user message missing sanitized reminder: %q", userContent)
+	}
+	if strings.Contains(userContent, "OpenCode") || strings.Contains(userContent, "Task Management") {
+		t.Fatalf("first user message still contains third-party prompt text: %q", userContent)
+	}
+}
+
+func TestPrependToFirstUserMessage_PrependsIntoTextBlockArray(t *testing.T) {
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"image","source":{"data":"..."}}]}]}`)
+
+	out := prependToFirstUserMessage(payload, "Reminder")
+
+	got := gjson.GetBytes(out, "messages.0.content.0.text").String()
+	if !strings.Contains(got, "<system-reminder>\nReminder\n</system-reminder>\n\nhello") {
+		t.Fatalf("messages.0.content.0.text = %q, want prepended reminder", got)
+	}
+}
+
+func TestPrependToFirstUserMessage_HandlesEmptyContentArray(t *testing.T) {
+	payload := []byte(`{"messages":[{"role":"user","content":[]}]}`)
+
+	out := prependToFirstUserMessage(payload, "Reminder")
+
+	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != "<system-reminder>\nReminder\n</system-reminder>\n\n" {
+		t.Fatalf("messages.0.content.0.text = %q, want prepended reminder block", got)
+	}
+}
+
+func TestBuildTextBlock_EscapesSpecialCharacters(t *testing.T) {
+	out := buildTextBlock("Use <xml> & \"quotes\"\nnext", nil)
+
+	if got := gjson.Get(out, "type").String(); got != "text" {
+		t.Fatalf("type = %q, want %q", got, "text")
+	}
+	if got := gjson.Get(out, "text").String(); got != "Use <xml> & \"quotes\"\nnext" {
+		t.Fatalf("text = %q, want escaped original text", got)
+	}
+	if gjson.Get(out, "cache_control").Exists() {
+		t.Fatal("cache_control should be omitted when not requested")
+	}
+}
+
+func TestCheckSystemInstructionsWithMode_BillingHeaderUsesEscapedTextBlock(t *testing.T) {
+	payload := []byte(`{"system":"quote: \"here\"","messages":[{"role":"user","content":"hi"}]}`)
+
+	out := checkSystemInstructionsWithMode(payload, false)
+
+	if got := gjson.GetBytes(out, "system.0.type").String(); got != "text" {
+		t.Fatalf("system.0.type = %q, want %q", got, "text")
+	}
+	if !strings.HasPrefix(gjson.GetBytes(out, "system.0.text").String(), "x-anthropic-billing-header:") {
+		t.Fatalf("system.0.text should contain billing header, got %q", gjson.GetBytes(out, "system.0.text").String())
 	}
 }

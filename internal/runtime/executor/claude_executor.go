@@ -44,6 +44,37 @@ type ClaudeExecutor struct {
 // Previously "proxy_" was used but this is a detectable fingerprint difference.
 const claudeToolPrefix = ""
 
+// oauthToolRenameMap maps lowercase third-party tool names to Claude Code-style
+// names to reduce OAuth fingerprint differences.
+var oauthToolRenameMap = map[string]string{
+	"bash":         "Bash",
+	"read":         "Read",
+	"write":        "Write",
+	"edit":         "Edit",
+	"glob":         "Glob",
+	"grep":         "Grep",
+	"task":         "Task",
+	"webfetch":     "WebFetch",
+	"todowrite":    "TodoWrite",
+	"question":     "Question",
+	"skill":        "Skill",
+	"ls":           "LS",
+	"todoread":     "TodoRead",
+	"notebookedit": "NotebookEdit",
+}
+
+var oauthToolRenameReverseMap = func() map[string]string {
+	out := make(map[string]string, len(oauthToolRenameMap))
+	for original, renamed := range oauthToolRenameMap {
+		out[renamed] = original
+	}
+	return out
+}()
+
+// Tools that must still be removed from OAuth requests after remapping.
+// Currently empty: all known tools are mapped instead of removed.
+var oauthToolsToRemove = map[string]bool{}
+
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
 
 func (e *ClaudeExecutor) Identifier() string { return "claude" }
@@ -153,6 +184,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 		bodyForUpstream = applyClaudeToolPrefix(body, claudeToolPrefix)
 	}
+	if isClaudeOAuthToken(apiKey) {
+		bodyForUpstream = remapOAuthToolNames(bodyForUpstream)
+	}
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
@@ -243,6 +277,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 		data = stripClaudeToolPrefixFromResponse(data, claudeToolPrefix)
 	}
+	if isClaudeOAuthToken(apiKey) {
+		data = reverseRemapOAuthToolNames(data)
+	}
 	var param any
 	out := sdktranslator.TranslateNonStream(
 		ctx,
@@ -315,6 +352,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	bodyForUpstream := body
 	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 		bodyForUpstream = applyClaudeToolPrefix(body, claudeToolPrefix)
+	}
+	if isClaudeOAuthToken(apiKey) {
+		bodyForUpstream = remapOAuthToolNames(bodyForUpstream)
 	}
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
@@ -404,6 +444,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 					line = stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
 				}
+				if isClaudeOAuthToken(apiKey) {
+					line = reverseRemapOAuthToolNamesFromStreamLine(line)
+				}
 				// Forward the line as-is to preserve SSE format
 				cloned := make([]byte, len(line)+1)
 				copy(cloned, line)
@@ -430,6 +473,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 			if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 				line = stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
+			}
+			if isClaudeOAuthToken(apiKey) {
+				line = reverseRemapOAuthToolNamesFromStreamLine(line)
 			}
 			chunks := sdktranslator.TranslateStream(
 				ctx,
@@ -482,6 +528,9 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	extraBetas, body = extractAndRemoveBetas(body)
 	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 		body = applyClaudeToolPrefix(body, claudeToolPrefix)
+	}
+	if isClaudeOAuthToken(apiKey) {
+		body = remapOAuthToolNames(body)
 	}
 
 	url := fmt.Sprintf("%s/v1/messages/count_tokens?beta=true", baseURL)
@@ -900,6 +949,168 @@ func isClaudeOAuthToken(apiKey string) bool {
 	return strings.Contains(apiKey, "sk-ant-oat")
 }
 
+// remapOAuthToolNames rewrites third-party tool names to Claude Code-style names
+// and removes tools without an official equivalent. It also keeps tool_choice and
+// message tool references consistent with the rewritten tools array.
+func remapOAuthToolNames(body []byte) []byte {
+	tools := gjson.GetBytes(body, "tools")
+	if tools.Exists() && tools.IsArray() {
+		var toolsJSON strings.Builder
+		toolsJSON.WriteByte('[')
+		toolCount := 0
+		tools.ForEach(func(_, tool gjson.Result) bool {
+			if tool.Get("type").Exists() && tool.Get("type").String() != "" {
+				if toolCount > 0 {
+					toolsJSON.WriteByte(',')
+				}
+				toolsJSON.WriteString(tool.Raw)
+				toolCount++
+				return true
+			}
+
+			name := tool.Get("name").String()
+			if oauthToolsToRemove[name] {
+				return true
+			}
+
+			toolJSON := tool.Raw
+			if newName, ok := oauthToolRenameMap[name]; ok {
+				if updatedTool, err := sjson.Set(toolJSON, "name", newName); err == nil {
+					toolJSON = updatedTool
+				}
+			}
+			if toolCount > 0 {
+				toolsJSON.WriteByte(',')
+			}
+			toolsJSON.WriteString(toolJSON)
+			toolCount++
+			return true
+		})
+		toolsJSON.WriteByte(']')
+		body, _ = sjson.SetRawBytes(body, "tools", []byte(toolsJSON.String()))
+	}
+
+	if gjson.GetBytes(body, "tool_choice.type").String() == "tool" {
+		toolChoiceName := gjson.GetBytes(body, "tool_choice.name").String()
+		if oauthToolsToRemove[toolChoiceName] {
+			body, _ = sjson.DeleteBytes(body, "tool_choice")
+		} else if newName, ok := oauthToolRenameMap[toolChoiceName]; ok {
+			body, _ = sjson.SetBytes(body, "tool_choice.name", newName)
+		}
+	}
+
+	if messages := gjson.GetBytes(body, "messages"); messages.Exists() && messages.IsArray() {
+		messages.ForEach(func(msgIndex, msg gjson.Result) bool {
+			content := msg.Get("content")
+			if !content.Exists() || !content.IsArray() {
+				return true
+			}
+			content.ForEach(func(contentIndex, part gjson.Result) bool {
+				switch part.Get("type").String() {
+				case "tool_use":
+					name := part.Get("name").String()
+					if newName, ok := oauthToolRenameMap[name]; ok {
+						path := fmt.Sprintf("messages.%d.content.%d.name", msgIndex.Int(), contentIndex.Int())
+						body, _ = sjson.SetBytes(body, path, newName)
+					}
+				case "tool_reference":
+					toolName := part.Get("tool_name").String()
+					if newName, ok := oauthToolRenameMap[toolName]; ok {
+						path := fmt.Sprintf("messages.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int())
+						body, _ = sjson.SetBytes(body, path, newName)
+					}
+				case "tool_result":
+					nestedContent := part.Get("content")
+					if nestedContent.Exists() && nestedContent.IsArray() {
+						nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
+							if nestedPart.Get("type").String() == "tool_reference" {
+								nestedToolName := nestedPart.Get("tool_name").String()
+								if newName, ok := oauthToolRenameMap[nestedToolName]; ok {
+									nestedPath := fmt.Sprintf("messages.%d.content.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int(), nestedIndex.Int())
+									body, _ = sjson.SetBytes(body, nestedPath, newName)
+								}
+							}
+							return true
+						})
+					}
+				}
+				return true
+			})
+			return true
+		})
+	}
+
+	return body
+}
+
+func reverseRemapOAuthToolNames(body []byte) []byte {
+	content := gjson.GetBytes(body, "content")
+	if !content.Exists() || !content.IsArray() {
+		return body
+	}
+	content.ForEach(func(index, part gjson.Result) bool {
+		switch part.Get("type").String() {
+		case "tool_use":
+			name := part.Get("name").String()
+			if original, ok := oauthToolRenameReverseMap[name]; ok {
+				path := fmt.Sprintf("content.%d.name", index.Int())
+				body, _ = sjson.SetBytes(body, path, original)
+			}
+		case "tool_reference":
+			toolName := part.Get("tool_name").String()
+			if original, ok := oauthToolRenameReverseMap[toolName]; ok {
+				path := fmt.Sprintf("content.%d.tool_name", index.Int())
+				body, _ = sjson.SetBytes(body, path, original)
+			}
+		}
+		return true
+	})
+	return body
+}
+
+func reverseRemapOAuthToolNamesFromStreamLine(line []byte) []byte {
+	payload := jsonPayload(line)
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return line
+	}
+	contentBlock := gjson.GetBytes(payload, "content_block")
+	if !contentBlock.Exists() {
+		return line
+	}
+
+	var (
+		updated []byte
+		err     error
+	)
+	switch contentBlock.Get("type").String() {
+	case "tool_use":
+		name := contentBlock.Get("name").String()
+		original, ok := oauthToolRenameReverseMap[name]
+		if !ok {
+			return line
+		}
+		updated, err = sjson.SetBytes(payload, "content_block.name", original)
+	case "tool_reference":
+		toolName := contentBlock.Get("tool_name").String()
+		original, ok := oauthToolRenameReverseMap[toolName]
+		if !ok {
+			return line
+		}
+		updated, err = sjson.SetBytes(payload, "content_block.tool_name", original)
+	default:
+		return line
+	}
+	if err != nil {
+		return line
+	}
+
+	trimmed := bytes.TrimSpace(line)
+	if bytes.HasPrefix(trimmed, []byte("data:")) {
+		return append([]byte("data: "), updated...)
+	}
+	return updated
+}
+
 func applyClaudeToolPrefix(body []byte, prefix string) []byte {
 	if prefix == "" {
 		return body
@@ -1190,16 +1401,20 @@ func generateBillingHeader(payload []byte) string {
 //	system[1]: agent identifier (no cache_control)
 //	system[2..]: user system messages (cache_control added when missing)
 func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
+	return checkSystemInstructionsWithOAuthMode(payload, strictMode, false)
+}
+
+func checkSystemInstructionsWithOAuthMode(payload []byte, strictMode bool, oauthMode bool) []byte {
 	system := gjson.GetBytes(payload, "system")
 
 	billingText := generateBillingHeader(payload)
-	billingBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, billingText)
+	billingBlock := buildTextBlock(billingText, nil)
 	// No cache_control on the agent block. It is a cloaking artifact with zero cache
 	// value (the last system block is what actually triggers caching of all system content).
 	// Including any cache_control here creates an intra-system TTL ordering violation
 	// when the client's system blocks use ttl='1h' (prompt-caching-scope-2026-01-05 beta
 	// forbids 1h blocks after 5m blocks, and a no-TTL block defaults to 5m).
-	agentBlock := `{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."}`
+	agentBlock := buildTextBlock("You are a Claude agent, built on Anthropic's Claude Agent SDK.", nil)
 
 	if strictMode {
 		// Strict mode: billing header + agent identifier only
@@ -1216,9 +1431,18 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 	}
 
 	result := "[" + billingBlock + "," + agentBlock
+	var userSystemParts []string
 	if system.IsArray() {
 		system.ForEach(func(_, part gjson.Result) bool {
 			if part.Get("type").String() == "text" {
+				text := strings.TrimSpace(part.Get("text").String())
+				if text == "" {
+					return true
+				}
+				if oauthMode {
+					userSystemParts = append(userSystemParts, text)
+					return true
+				}
 				// Add cache_control to user system messages if not present.
 				// Do NOT add ttl — let it inherit the default (5m) to avoid
 				// TTL ordering violations with the prompt-caching-scope-2026-01-05 beta.
@@ -1230,14 +1454,107 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 			}
 			return true
 		})
-	} else if system.Type == gjson.String && system.String() != "" {
-		partJSON := `{"type":"text","cache_control":{"type":"ephemeral"}}`
-		partJSON, _ = sjson.Set(partJSON, "text", system.String())
-		result += "," + partJSON
+	} else if system.Type == gjson.String {
+		text := strings.TrimSpace(system.String())
+		if text != "" {
+			if oauthMode {
+				userSystemParts = append(userSystemParts, text)
+			} else {
+				partJSON := buildTextBlock(system.String(), map[string]string{"type": "ephemeral"})
+				result += "," + partJSON
+			}
+		}
 	}
 	result += "]"
 
 	payload, _ = sjson.SetRawBytes(payload, "system", []byte(result))
+	if oauthMode && len(userSystemParts) > 0 {
+		combined := sanitizeForwardedSystemPrompt(strings.Join(userSystemParts, "\n\n"))
+		if strings.TrimSpace(combined) != "" {
+			payload = prependToFirstUserMessage(payload, combined)
+		}
+	}
+	return payload
+}
+
+// sanitizeForwardedSystemPrompt reduces forwarded third-party system context to a
+// tiny neutral reminder for Claude OAuth cloaking.
+func sanitizeForwardedSystemPrompt(text string) string {
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	return strings.TrimSpace(`Use the available tools when needed to help with software engineering tasks.
+Keep responses concise and focused on the user's request.
+Prefer acting on the user's task over describing product-specific workflows.`)
+}
+
+// buildTextBlock constructs a text block JSON object using proper escaping.
+// cacheControl is optional; when present only ttl is respected.
+func buildTextBlock(text string, cacheControl map[string]string) string {
+	block := []byte(`{"type":"text"}`)
+	block, _ = sjson.SetBytes(block, "text", text)
+	if cacheControl != nil && len(cacheControl) > 0 {
+		cc := `{"type":"ephemeral"`
+		if ttl, ok := cacheControl["ttl"]; ok {
+			cc += fmt.Sprintf(`,"ttl":"%s"`, ttl)
+		}
+		cc += "}"
+		block, _ = sjson.SetRawBytes(block, "cache_control", []byte(cc))
+	}
+	return string(block)
+}
+
+// prependToFirstUserMessage prepends text content to the first user message.
+func prependToFirstUserMessage(payload []byte, text string) []byte {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return payload
+	}
+
+	firstUserIdx := -1
+	messages.ForEach(func(idx, msg gjson.Result) bool {
+		if msg.Get("role").String() == "user" {
+			firstUserIdx = int(idx.Int())
+			return false
+		}
+		return true
+	})
+	if firstUserIdx < 0 {
+		return payload
+	}
+
+	prefixText := "<system-reminder>\n" + text + "\n</system-reminder>\n\n"
+	contentPath := fmt.Sprintf("messages.%d.content", firstUserIdx)
+	content := gjson.GetBytes(payload, contentPath)
+	switch {
+	case content.Type == gjson.String:
+		payload, _ = sjson.SetBytes(payload, contentPath, prefixText+content.String())
+	case content.IsArray():
+		firstTextIdx := -1
+		content.ForEach(func(idx, part gjson.Result) bool {
+			if part.Get("type").String() == "text" {
+				firstTextIdx = int(idx.Int())
+				return false
+			}
+			return true
+		})
+		if firstTextIdx >= 0 {
+			textPath := fmt.Sprintf("%s.%d.text", contentPath, firstTextIdx)
+			current := gjson.GetBytes(payload, textPath).String()
+			payload, _ = sjson.SetBytes(payload, textPath, prefixText+current)
+			return payload
+		}
+		prefixBlock := `{"type":"text"}`
+		prefixBlock, _ = sjson.Set(prefixBlock, "text", prefixText)
+		contentRaw := content.Raw
+		if contentRaw == "[]" || contentRaw == "" {
+			payload, _ = sjson.SetRawBytes(payload, contentPath, []byte("["+prefixBlock+"]"))
+		} else if len(contentRaw) >= 2 {
+			payload, _ = sjson.SetRawBytes(payload, contentPath, []byte("["+prefixBlock+","+contentRaw[1:]))
+		}
+	default:
+		payload, _ = sjson.SetBytes(payload, contentPath, prefixText)
+	}
 	return payload
 }
 
@@ -1286,10 +1603,11 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	if !shouldCloak(cloakMode, clientUserAgent) {
 		return payload
 	}
+	oauthToken := isClaudeOAuthToken(apiKey)
 
 	// Skip system instructions for claude-3-5-haiku models
 	if !strings.HasPrefix(model, "claude-3-5-haiku") {
-		payload = checkSystemInstructionsWithMode(payload, strictMode)
+		payload = checkSystemInstructionsWithOAuthMode(payload, strictMode, oauthToken)
 	}
 
 	// Inject fake user ID

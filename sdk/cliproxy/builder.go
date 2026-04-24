@@ -5,7 +5,6 @@ package cliproxy
 
 import (
 	"fmt"
-	"strings"
 
 	configaccess "github.com/router-for-me/CLIProxyAPI/v6/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
@@ -207,19 +206,7 @@ func (b *Builder) Build() (*Service, error) {
 			dirSetter.SetBaseDir(b.cfg.AuthDir)
 		}
 
-		strategy := ""
-		if b.cfg != nil {
-			strategy = strings.ToLower(strings.TrimSpace(b.cfg.Routing.Strategy))
-		}
-		var selector coreauth.Selector
-		switch strategy {
-		case "fill-first", "fillfirst", "ff":
-			selector = &coreauth.FillFirstSelector{}
-		default:
-			selector = &coreauth.RoundRobinSelector{}
-		}
-
-		coreManager = coreauth.NewManager(tokenStore, selector, nil)
+		coreManager = coreauth.NewManager(tokenStore, selectorFromRoutingConfig(b.cfg), nil)
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())

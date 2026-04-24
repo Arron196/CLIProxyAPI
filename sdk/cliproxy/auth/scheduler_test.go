@@ -39,6 +39,10 @@ type trackingSelector struct {
 	lastAuthID []string
 }
 
+type stoppableSelector struct {
+	stops int
+}
+
 func (s *trackingSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	s.calls++
 	s.lastAuthID = s.lastAuthID[:0]
@@ -49,6 +53,17 @@ func (s *trackingSelector) Pick(ctx context.Context, provider, model string, opt
 		return nil, nil
 	}
 	return auths[len(auths)-1], nil
+}
+
+func (s *stoppableSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	if len(auths) == 0 {
+		return nil, nil
+	}
+	return auths[0], nil
+}
+
+func (s *stoppableSelector) Stop() {
+	s.stops++
 }
 
 func newSchedulerForTest(selector Selector, auths ...*Auth) *authScheduler {
@@ -706,7 +721,7 @@ func TestManager_Register_SchedulerSnapshotDetachedFromManagerState(t *testing.T
 	}
 }
 
-func TestSchedulerPick_MixedProvidersUsesProviderRotationOverReadyCandidates(t *testing.T) {
+func TestSchedulerPick_MixedProvidersUsesWeightedProviderRotationOverReadyCandidates(t *testing.T) {
 	t.Parallel()
 
 	scheduler := newSchedulerForTest(
@@ -716,8 +731,8 @@ func TestSchedulerPick_MixedProvidersUsesProviderRotationOverReadyCandidates(t *
 		&Auth{ID: "claude-a", Provider: "claude"},
 	)
 
-	wantProviders := []string{"gemini", "claude", "gemini", "claude"}
-	wantIDs := []string{"gemini-a", "claude-a", "gemini-b", "claude-a"}
+	wantProviders := []string{"gemini", "gemini", "claude", "gemini"}
+	wantIDs := []string{"gemini-a", "gemini-b", "claude-a", "gemini-a"}
 	for index := range wantProviders {
 		got, provider, errPick := scheduler.pickMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil)
 		if errPick != nil {
@@ -770,7 +785,7 @@ func TestSchedulerPick_MixedProvidersPrefersHighestPriorityTier(t *testing.T) {
 	}
 }
 
-func TestManager_PickNextMixed_UsesProviderRotationBeforeCredentialRotation(t *testing.T) {
+func TestManager_PickNextMixed_UsesWeightedProviderRotationBeforeCredentialRotation(t *testing.T) {
 	t.Parallel()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
@@ -786,8 +801,8 @@ func TestManager_PickNextMixed_UsesProviderRotationBeforeCredentialRotation(t *t
 		t.Fatalf("Register(claude-a) error = %v", errRegister)
 	}
 
-	wantProviders := []string{"gemini", "claude", "gemini", "claude"}
-	wantIDs := []string{"gemini-a", "claude-a", "gemini-b", "claude-a"}
+	wantProviders := []string{"gemini", "gemini", "claude", "gemini"}
+	wantIDs := []string{"gemini-a", "gemini-b", "claude-a", "gemini-a"}
 	for index := range wantProviders {
 		got, _, provider, errPick := manager.pickNextMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, map[string]struct{}{})
 		if errPick != nil {
@@ -849,6 +864,45 @@ func TestManager_InitializesSchedulerForBuiltInSelector(t *testing.T) {
 	}
 }
 
+func TestManager_SetSelector_StopsPreviousStoppableSelector(t *testing.T) {
+	t.Parallel()
+
+	previous := &stoppableSelector{}
+	manager := NewManager(nil, previous, nil)
+
+	manager.SetSelector(&RoundRobinSelector{})
+
+	if previous.stops != 1 {
+		t.Fatalf("previous.stops = %d, want %d", previous.stops, 1)
+	}
+}
+
+func TestManager_SetSelector_DoesNotStopSameSelectorInstance(t *testing.T) {
+	t.Parallel()
+
+	selector := &stoppableSelector{}
+	manager := NewManager(nil, selector, nil)
+
+	manager.SetSelector(selector)
+
+	if selector.stops != 0 {
+		t.Fatalf("selector.stops = %d, want %d", selector.stops, 0)
+	}
+}
+
+func TestManager_StopSelector_StopsCurrentStoppableSelector(t *testing.T) {
+	t.Parallel()
+
+	selector := &stoppableSelector{}
+	manager := NewManager(nil, selector, nil)
+
+	manager.StopSelector()
+
+	if selector.stops != 1 {
+		t.Fatalf("selector.stops = %d, want %d", selector.stops, 1)
+	}
+}
+
 func TestManager_SchedulerTracksRegisterAndUpdate(t *testing.T) {
 	t.Parallel()
 
@@ -897,8 +951,8 @@ func TestManager_PickNextMixed_UsesSchedulerRotation(t *testing.T) {
 		t.Fatalf("Register(claude-a) error = %v", errRegister)
 	}
 
-	wantProviders := []string{"gemini", "claude", "gemini", "claude"}
-	wantIDs := []string{"gemini-a", "claude-a", "gemini-b", "claude-a"}
+	wantProviders := []string{"gemini", "gemini", "claude", "gemini"}
+	wantIDs := []string{"gemini-a", "gemini-b", "claude-a", "gemini-a"}
 	for index := range wantProviders {
 		got, _, provider, errPick := manager.pickNextMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil)
 		if errPick != nil {

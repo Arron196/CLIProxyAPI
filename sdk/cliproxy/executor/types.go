@@ -10,6 +10,10 @@ import (
 // RequestedModelMetadataKey stores the client-requested model name in Options.Metadata.
 const RequestedModelMetadataKey = "requested_model"
 
+// AuthRouteModelMetadataKey stores an optional model override used only for auth
+// selection and per-auth availability filtering. Executors still receive req.Model.
+const AuthRouteModelMetadataKey = "auth_route_model"
+
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"

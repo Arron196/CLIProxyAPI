@@ -63,8 +63,12 @@ const (
 	refreshMaxConcurrency = 16
 	refreshPendingBackoff = time.Minute
 	refreshFailureBackoff = 5 * time.Minute
-	quotaBackoffBase      = time.Second
-	quotaBackoffMax       = 30 * time.Minute
+	// refreshIneffectiveBackoff throttles refresh attempts when an executor returns
+	// success but the auth still evaluates as needing refresh (for example when an
+	// expired token was not actually rotated).
+	refreshIneffectiveBackoff = 30 * time.Second
+	quotaBackoffBase          = time.Second
+	quotaBackoffMax           = 30 * time.Minute
 	// unlimitedRetrySafetyCap bounds legacy "retry all credentials" mode so a
 	// single unhealthy request cannot fan out across thousands of auth files.
 	unlimitedRetrySafetyCap = 32
@@ -105,6 +109,11 @@ type Result struct {
 // Selector chooses an auth candidate for execution.
 type Selector interface {
 	Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error)
+}
+
+// StoppableSelector releases background resources held by a selector.
+type StoppableSelector interface {
+	Stop()
 }
 
 // Hook captures lifecycle callbacks for observing auth changes.
@@ -169,8 +178,8 @@ type Manager struct {
 	rtProvider RoundTripperProvider
 
 	// Auto refresh state
-	refreshCancel    context.CancelFunc
-	refreshSemaphore chan struct{}
+	refreshCancel context.CancelFunc
+	refreshLoop   *authAutoRefreshLoop
 
 	// Async persistence state for high-frequency runtime updates.
 	persistStartOnce sync.Once
@@ -194,7 +203,6 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		auths:            make(map[string]*Auth),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
-		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
 	}
 	manager.hookValue.Store(hookState{hook: hook})
 	// atomic.Value requires non-nil initial value.
@@ -255,11 +263,36 @@ func (m *Manager) SetSelector(selector Selector) {
 		selector = &RoundRobinSelector{}
 	}
 	m.mu.Lock()
+	previous := m.selector
 	m.selector = selector
 	m.mu.Unlock()
+	stopSelectorIfReplaced(previous, selector)
 	if m.scheduler != nil {
 		m.scheduler.setSelector(selector)
 		m.syncScheduler()
+	}
+}
+
+// StopSelector releases resources owned by the current selector, if any.
+func (m *Manager) StopSelector() {
+	if m == nil {
+		return
+	}
+	m.mu.RLock()
+	selector := m.selector
+	m.mu.RUnlock()
+	stopSelectorIfReplaced(selector, nil)
+}
+
+func stopSelectorIfReplaced(previous, next Selector) {
+	if previous == nil {
+		return
+	}
+	if next != nil && previous == next {
+		return
+	}
+	if stoppable, ok := previous.(StoppableSelector); ok && stoppable != nil {
+		stoppable.Stop()
 	}
 }
 
@@ -507,6 +540,18 @@ func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string) ([]stri
 	candidates := m.executionModelCandidates(auth, routeModel)
 	pooled := len(candidates) > 1
 	return filterExecutionModels(auth, routeModel, candidates, pooled), pooled
+}
+
+func (m *Manager) preparedExecutionModelsForRequest(auth *Auth, executionModel, routeModel string) ([]string, bool) {
+	executionModel = strings.TrimSpace(executionModel)
+	routeModel = strings.TrimSpace(routeModel)
+	if routeModel == "" || routeModel == executionModel {
+		return m.preparedExecutionModels(auth, executionModel)
+	}
+	if executionModel == "" {
+		return nil, false
+	}
+	return filterExecutionModels(auth, routeModel, []string{executionModel}, false), false
 }
 
 func (m *Manager) prepareExecutionModels(auth *Auth, routeModel string) []string {
@@ -938,6 +983,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		auth.ID = uuid.NewString()
 	}
 	auth.EnsureIndex()
+	ApplyCustomHeadersFromMetadata(auth)
 	authClone := auth.Clone()
 	schedulerSnapshot := authClone.Clone()
 	m.mu.Lock()
@@ -947,6 +993,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(schedulerSnapshot)
 	}
+	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
 	hook := m.Hook()
 	hook.OnAuthRegistered(ctx, auth.Clone())
@@ -971,6 +1018,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		}
 	}
 	auth.EnsureIndex()
+	ApplyCustomHeadersFromMetadata(auth)
 	authClone := auth.Clone()
 	schedulerSnapshot := authClone.Clone()
 	m.auths[auth.ID] = authClone
@@ -979,6 +1027,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(schedulerSnapshot)
 	}
+	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
 	hook := m.Hook()
 	hook.OnAuthUpdated(ctx, auth.Clone())
@@ -1003,6 +1052,7 @@ func (m *Manager) Load(ctx context.Context) error {
 			continue
 		}
 		auth.EnsureIndex()
+		ApplyCustomHeadersFromMetadata(auth)
 		m.auths[auth.ID] = auth.Clone()
 	}
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
@@ -1112,8 +1162,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
-	routeModel := req.Model
-	opts = ensureRequestedModelMetadata(opts, routeModel)
+	routeModel := routeModelFromRequest(req, opts)
+	opts = ensureRequestedModelMetadata(opts, req.Model)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	credentialRetryLimit := effectiveCredentialRetryLimit(maxRetryCredentials)
@@ -1158,7 +1208,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled := m.preparedExecutionModelsForRequest(auth, req.Model, routeModel)
 		if len(models) == 0 {
 			continue
 		}
@@ -1211,8 +1261,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
-	routeModel := req.Model
-	opts = ensureRequestedModelMetadata(opts, routeModel)
+	routeModel := routeModelFromRequest(req, opts)
+	opts = ensureRequestedModelMetadata(opts, req.Model)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	credentialRetryLimit := effectiveCredentialRetryLimit(maxRetryCredentials)
@@ -1257,7 +1307,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled := m.preparedExecutionModelsForRequest(auth, req.Model, routeModel)
 		if len(models) == 0 {
 			continue
 		}
@@ -1310,8 +1360,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	if len(providers) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
-	routeModel := req.Model
-	opts = ensureRequestedModelMetadata(opts, routeModel)
+	routeModel := routeModelFromRequest(req, opts)
+	opts = ensureRequestedModelMetadata(opts, req.Model)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	credentialRetryLimit := effectiveCredentialRetryLimit(maxRetryCredentials)
@@ -1355,7 +1405,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled := m.preparedExecutionModelsForRequest(auth, req.Model, routeModel)
 		if len(models) == 0 {
 			continue
 		}
@@ -1415,6 +1465,31 @@ func hasRequestedModelMetadata(meta map[string]any) bool {
 		return strings.TrimSpace(string(v)) != ""
 	default:
 		return false
+	}
+}
+
+func routeModelFromRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
+	if routeModel := routeModelFromMetadata(opts.Metadata); routeModel != "" {
+		return routeModel
+	}
+	return strings.TrimSpace(req.Model)
+}
+
+func routeModelFromMetadata(meta map[string]any) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	raw, ok := meta[cliproxyexecutor.AuthRouteModelMetadataKey]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []byte:
+		return strings.TrimSpace(string(v))
+	default:
+		return ""
 	}
 }
 
@@ -1840,79 +1915,81 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		} else {
 			if result.Model != "" {
-				state := ensureModelState(auth, result.Model)
-				state.Unavailable = true
-				state.Status = StatusError
-				state.UpdatedAt = now
-				if result.Error != nil {
-					state.LastError = cloneError(result.Error)
-					state.StatusMessage = result.Error.Message
-					auth.LastError = cloneError(result.Error)
-					auth.StatusMessage = result.Error.Message
-				}
+				if !isRequestScopedNotFoundResultError(result.Error) {
+					state := ensureModelState(auth, result.Model)
+					state.Unavailable = true
+					state.Status = StatusError
+					state.UpdatedAt = now
+					if result.Error != nil {
+						state.LastError = cloneError(result.Error)
+						state.StatusMessage = result.Error.Message
+						auth.LastError = cloneError(result.Error)
+						auth.StatusMessage = result.Error.Message
+					}
 
-				statusCode := statusCodeFromResult(result.Error)
-				if isModelSupportResultError(result.Error) {
-					next := now.Add(12 * time.Hour)
-					state.NextRetryAfter = next
-					suspendReason = "model_not_supported"
-					shouldSuspendModel = true
-				} else {
-					switch statusCode {
-					case 401:
-						next := now.Add(30 * time.Minute)
-						state.NextRetryAfter = next
-						suspendReason = "unauthorized"
-						shouldSuspendModel = true
-					case 402, 403:
-						next := now.Add(30 * time.Minute)
-						state.NextRetryAfter = next
-						suspendReason = "payment_required"
-						shouldSuspendModel = true
-					case 404:
+					statusCode := statusCodeFromResult(result.Error)
+					if isModelSupportResultError(result.Error) {
 						next := now.Add(12 * time.Hour)
 						state.NextRetryAfter = next
-						suspendReason = "not_found"
+						suspendReason = "model_not_supported"
 						shouldSuspendModel = true
-					case 429:
-						var next time.Time
-						backoffLevel := state.Quota.BackoffLevel
-						strikeCount := state.Quota.StrikeCount + 1
-						if result.RetryAfter != nil {
-							next = now.Add(*result.RetryAfter)
-						} else {
-							cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
-							if cooldown > 0 {
-								next = now.Add(cooldown)
-							}
-							backoffLevel = nextLevel
-						}
-						state.NextRetryAfter = next
-						state.Quota = QuotaState{
-							Exceeded:      true,
-							Reason:        "quota",
-							NextRecoverAt: next,
-							BackoffLevel:  backoffLevel,
-							StrikeCount:   strikeCount,
-						}
-						suspendReason = "quota"
-						shouldSuspendModel = true
-						setModelQuota = true
-					case 408, 500, 502, 503, 504:
-						if quotaCooldownDisabledForAuth(auth) {
-							state.NextRetryAfter = time.Time{}
-						} else {
-							next := now.Add(1 * time.Minute)
+					} else {
+						switch statusCode {
+						case 401:
+							next := now.Add(30 * time.Minute)
 							state.NextRetryAfter = next
+							suspendReason = "unauthorized"
+							shouldSuspendModel = true
+						case 402, 403:
+							next := now.Add(30 * time.Minute)
+							state.NextRetryAfter = next
+							suspendReason = "payment_required"
+							shouldSuspendModel = true
+						case 404:
+							next := now.Add(12 * time.Hour)
+							state.NextRetryAfter = next
+							suspendReason = "not_found"
+							shouldSuspendModel = true
+						case 429:
+							var next time.Time
+							backoffLevel := state.Quota.BackoffLevel
+							strikeCount := state.Quota.StrikeCount + 1
+							if result.RetryAfter != nil {
+								next = now.Add(*result.RetryAfter)
+							} else {
+								cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
+								if cooldown > 0 {
+									next = now.Add(cooldown)
+								}
+								backoffLevel = nextLevel
+							}
+							state.NextRetryAfter = next
+							state.Quota = QuotaState{
+								Exceeded:      true,
+								Reason:        "quota",
+								NextRecoverAt: next,
+								BackoffLevel:  backoffLevel,
+								StrikeCount:   strikeCount,
+							}
+							suspendReason = "quota"
+							shouldSuspendModel = true
+							setModelQuota = true
+						case 408, 500, 502, 503, 504:
+							if quotaCooldownDisabledForAuth(auth) {
+								state.NextRetryAfter = time.Time{}
+							} else {
+								next := now.Add(1 * time.Minute)
+								state.NextRetryAfter = next
+							}
+						default:
+							state.NextRetryAfter = time.Time{}
 						}
-					default:
-						state.NextRetryAfter = time.Time{}
 					}
-				}
 
-				auth.Status = StatusError
-				auth.UpdatedAt = now
-				updateAggregatedAvailability(auth, now)
+					auth.Status = StatusError
+					auth.UpdatedAt = now
+					updateAggregatedAvailability(auth, now)
+				}
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
 			}
@@ -2211,11 +2288,29 @@ func isModelSupportResultError(err *Error) bool {
 	return isModelSupportErrorMessage(err.Message)
 }
 
+func isRequestScopedNotFoundMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	return strings.Contains(lower, "item with id") &&
+		strings.Contains(lower, "not found") &&
+		strings.Contains(lower, "items are not persisted when `store` is set to false")
+}
+
+func isRequestScopedNotFoundResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	return statusCodeFromResult(err) == http.StatusNotFound && isRequestScopedNotFoundMessage(err.Message)
+}
+
 // isRequestInvalidError returns true if the error represents a caller-side
 // request-shape failure that should not keep poisoning auth state. Model-support
 // failures remain eligible for auth/upstream fallback, but 422 responses and
 // caller-side 400 validation signals such as invalid_request_error,
-// invalid_json_schema, or unsupported parameters are treated as request-invalid.
+// invalid_json_schema, request-scoped 404 item misses caused by `store=false`,
+// or unsupported parameters are treated as request-invalid.
 func isRequestInvalidError(err error) bool {
 	if err == nil {
 		return false
@@ -2227,6 +2322,8 @@ func isRequestInvalidError(err error) bool {
 	switch status {
 	case http.StatusBadRequest:
 		return isRequestInvalidBody(err.Error())
+	case http.StatusNotFound:
+		return isRequestScopedNotFoundMessage(err.Error())
 	case http.StatusUnprocessableEntity:
 		return true
 	default:
@@ -2744,96 +2841,42 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	if interval <= 0 {
 		interval = refreshCheckInterval
 	}
-	if m.refreshCancel != nil {
-		m.refreshCancel()
-		m.refreshCancel = nil
+
+	m.mu.Lock()
+	cancel := m.refreshCancel
+	m.refreshCancel = nil
+	m.refreshLoop = nil
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
+
 	ctx, cancel := context.WithCancel(parent)
+	workers := refreshMaxConcurrency
+	if cfg, ok := m.runtimeConfig.Load().(*internalconfig.Config); ok && cfg != nil && cfg.AuthAutoRefreshWorkers > 0 {
+		workers = cfg.AuthAutoRefreshWorkers
+	}
+	loop := newAuthAutoRefreshLoop(m, interval, workers)
+
+	m.mu.Lock()
 	m.refreshCancel = cancel
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		m.checkRefreshes(ctx)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				m.checkRefreshes(ctx)
-			}
-		}
-	}()
+	m.refreshLoop = loop
+	m.mu.Unlock()
+
+	loop.rebuild(time.Now())
+	go loop.run(ctx)
 }
 
 // StopAutoRefresh cancels the background refresh loop, if running.
 func (m *Manager) StopAutoRefresh() {
-	if m.refreshCancel != nil {
-		m.refreshCancel()
-		m.refreshCancel = nil
+	m.mu.Lock()
+	cancel := m.refreshCancel
+	m.refreshCancel = nil
+	m.refreshLoop = nil
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
-}
-
-func (m *Manager) checkRefreshes(ctx context.Context) {
-	// log.Debugf("checking refreshes")
-	now := time.Now()
-	for _, authID := range m.collectRefreshTargets(now) {
-		if !m.markRefreshPending(authID, now) {
-			continue
-		}
-		go m.refreshAuthWithLimit(ctx, authID)
-	}
-}
-
-func (m *Manager) collectRefreshTargets(now time.Time) []string {
-	if m == nil {
-		return nil
-	}
-	m.mu.RLock()
-	candidates := make([]*Auth, 0, len(m.auths))
-	for _, auth := range m.auths {
-		if auth == nil {
-			continue
-		}
-		if m.executors[auth.Provider] == nil {
-			continue
-		}
-		if auth.Disabled {
-			continue
-		}
-		if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {
-			continue
-		}
-		candidates = append(candidates, auth.Clone())
-	}
-	m.mu.RUnlock()
-
-	targets := make([]string, 0, len(candidates))
-	for _, auth := range candidates {
-		if auth == nil {
-			continue
-		}
-		typ, _ := auth.AccountInfo()
-		if typ == "api_key" || !m.shouldRefresh(auth, now) {
-			continue
-		}
-		log.Debugf("checking refresh for %s, %s, %s", auth.Provider, auth.ID, typ)
-		targets = append(targets, auth.ID)
-	}
-	return targets
-}
-
-func (m *Manager) refreshAuthWithLimit(ctx context.Context, id string) {
-	if m.refreshSemaphore == nil {
-		m.refreshAuth(ctx, id)
-		return
-	}
-	select {
-	case m.refreshSemaphore <- struct{}{}:
-		defer func() { <-m.refreshSemaphore }()
-	case <-ctx.Done():
-		return
-	}
-	m.refreshAuth(ctx, id)
 }
 
 func (m *Manager) snapshotAuths() []*Auth {
@@ -2844,6 +2887,19 @@ func (m *Manager) snapshotAuths() []*Auth {
 		out = append(out, a.Clone())
 	}
 	return out
+}
+
+func (m *Manager) queueRefreshReschedule(authID string) {
+	if m == nil || authID == "" {
+		return
+	}
+	m.mu.RLock()
+	loop := m.refreshLoop
+	m.mu.RUnlock()
+	if loop == nil {
+		return
+	}
+	loop.queueReschedule(authID)
 }
 
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
@@ -3053,16 +3109,20 @@ func lookupMetadataTime(meta map[string]any, keys ...string) (time.Time, bool) {
 
 func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	auth, ok := m.auths[id]
 	if !ok || auth == nil || auth.Disabled {
+		m.mu.Unlock()
 		return false
 	}
 	if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {
+		m.mu.Unlock()
 		return false
 	}
 	auth.NextRefreshAfter = now.Add(refreshPendingBackoff)
 	m.auths[id] = auth
+	m.mu.Unlock()
+
+	m.queueRefreshReschedule(id)
 	return true
 }
 
@@ -3093,17 +3153,22 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		if status := terminalStatusCodeFromError(err); status > 0 {
 			refreshErr.HTTPStatus = status
 		}
+		shouldReschedule := false
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 			current.LastError = refreshErr
 			current.UpdatedAt = now
 			m.auths[id] = current
+			shouldReschedule = true
 			if m.scheduler != nil {
 				m.scheduler.upsertAuth(current.Clone())
 			}
 		}
 		m.mu.Unlock()
+		if shouldReschedule {
+			m.queueRefreshReschedule(id)
+		}
 		return
 	}
 	if updated == nil {
@@ -3118,6 +3183,9 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	updated.NextRefreshAfter = time.Time{}
 	updated.LastError = nil
 	updated.UpdatedAt = now
+	if m.shouldRefresh(updated, now) {
+		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
+	}
 	_, _ = m.Update(ctx, updated)
 }
 

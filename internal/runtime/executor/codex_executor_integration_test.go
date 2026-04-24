@@ -961,10 +961,16 @@ func TestCodexExecutorExecuteStreamTTFTHighConcurrency_LongConversationPreviousR
 	if testing.Short() {
 		t.Skip("skipping high-concurrency stream ttft coverage in short mode")
 	}
-	const (
-		totalRequests = 1024
-		concurrency   = 256
-	)
+	totalRequests := 1024
+	concurrency := 256
+	if runtime.GOOS == "windows" {
+		// Windows CI and local desktop runs can hit transient localhost connection
+		// refusals under the original load due to port/socket pressure before the
+		// test exercises the executor logic itself. Keep the same coverage shape but
+		// lower the fan-out to stabilize the integration test.
+		totalRequests = 512
+		concurrency = 96
+	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)

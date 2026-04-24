@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -36,6 +37,46 @@ const (
 )
 
 var dataTag = []byte("data:")
+
+func collectCodexOutputItemDone(eventData []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback *[][]byte) {
+	itemResult := gjson.GetBytes(eventData, "item")
+	if !itemResult.Exists() || itemResult.Type != gjson.JSON {
+		return
+	}
+	outputIndexResult := gjson.GetBytes(eventData, "output_index")
+	if outputIndexResult.Exists() {
+		outputItemsByIndex[outputIndexResult.Int()] = []byte(itemResult.Raw)
+		return
+	}
+	*outputItemsFallback = append(*outputItemsFallback, []byte(itemResult.Raw))
+}
+
+func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
+	outputResult := gjson.GetBytes(eventData, "response.output")
+	if outputResult.Exists() && outputResult.IsArray() && len(outputResult.Array()) > 0 {
+		return eventData
+	}
+	if len(outputItemsByIndex) == 0 && len(outputItemsFallback) == 0 {
+		return eventData
+	}
+
+	completedDataPatched, _ := sjson.SetRawBytes(eventData, "response.output", []byte(`[]`))
+
+	indexes := make([]int64, 0, len(outputItemsByIndex))
+	for idx := range outputItemsByIndex {
+		indexes = append(indexes, idx)
+	}
+	sort.Slice(indexes, func(i, j int) bool {
+		return indexes[i] < indexes[j]
+	})
+	for _, idx := range indexes {
+		completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output.-1", outputItemsByIndex[idx])
+	}
+	for _, item := range outputItemsFallback {
+		completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output.-1", item)
+	}
+	return completedDataPatched
+}
 
 // CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
@@ -334,6 +375,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		outputItemsByIndex := make(map[int64][]byte)
+		var outputItemsFallback [][]byte
 		translateOriginalPayload, translateBody := originalPayload, body
 		if !codexResponseTranslatorNeedsRequestPayloads(from) {
 			translateOriginalPayload = nil
@@ -345,7 +388,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
-				if gjson.GetBytes(data, "type").String() == "response.completed" {
+				switch gjson.GetBytes(data, "type").String() {
+				case "response.output_item.done":
+					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
+				case "response.completed":
+					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
+					line = append([]byte("data: "), data...)
 					if detail, ok := parseCodexUsage(data); ok {
 						reporter.publish(ctx, detail)
 					}
@@ -586,13 +634,19 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 
 func readCodexCompletedEvent(ctx context.Context, cfg *config.Config, body io.ReadCloser, reporter *usageReporter) ([]byte, error) {
 	reader := bufio.NewReader(body)
+	outputItemsByIndex := make(map[int64][]byte)
+	var outputItemsFallback [][]byte
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			appendAPIResponseChunk(ctx, cfg, line)
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[len(dataTag):])
-				if gjson.GetBytes(data, "type").String() == "response.completed" {
+				switch gjson.GetBytes(data, "type").String() {
+				case "response.output_item.done":
+					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
+				case "response.completed":
+					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 					if detail, ok := parseCodexUsage(data); ok {
 						reporter.publish(ctx, detail)
 					}
