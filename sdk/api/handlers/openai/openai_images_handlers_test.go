@@ -77,3 +77,16 @@ func TestBuildImagesAPIResponseSupportsURLFormat(t *testing.T) {
 		t.Fatalf("data.0.url = %q, want %q", got, "data:image/webp;base64,QUJD")
 	}
 }
+
+func TestInitialImagesStreamDisconnectError(t *testing.T) {
+	errMsg := initialImagesStreamDisconnectError()
+	if errMsg == nil {
+		t.Fatalf("initialImagesStreamDisconnectError() = nil")
+	}
+	if errMsg.StatusCode != 502 {
+		t.Fatalf("status = %d, want %d", errMsg.StatusCode, 502)
+	}
+	if errMsg.Error == nil || errMsg.Error.Error() != "stream disconnected before first event" {
+		t.Fatalf("error = %v, want %q", errMsg.Error, "stream disconnected before first event")
+	}
+}

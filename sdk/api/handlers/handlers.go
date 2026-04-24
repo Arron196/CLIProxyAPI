@@ -561,6 +561,14 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 // This path is the only supported execution route.
 // The returned http.Header carries upstream response headers captured before streaming begins.
 func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	return h.executeStreamWithRouteModel(ctx, handlerType, modelName, "", rawJSON, alt, false)
+}
+
+func (h *BaseAPIHandler) ExecuteStreamWithAuthRouteModel(ctx context.Context, handlerType, modelName, routeModel string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	return h.executeStreamWithRouteModel(ctx, handlerType, modelName, routeModel, rawJSON, alt, true)
+}
+
+func (h *BaseAPIHandler) executeStreamWithRouteModel(ctx context.Context, handlerType, modelName, routeModel string, rawJSON []byte, alt string, allowRouteImageModel bool) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -568,8 +576,23 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		close(errChan)
 		return nil, nil, errChan
 	}
+	authRouteModel := normalizedModel
+	if trimmedRouteModel := strings.TrimSpace(routeModel); trimmedRouteModel != "" && trimmedRouteModel != normalizedModel {
+		var routeProviders []string
+		routeProviders, authRouteModel, errMsg = h.getRequestDetailsWithOptions(trimmedRouteModel, requestDetailsOptions{allowImageModel: allowRouteImageModel})
+		if errMsg != nil {
+			errChan := make(chan *interfaces.ErrorMessage, 1)
+			errChan <- errMsg
+			close(errChan)
+			return nil, nil, errChan
+		}
+		providers = routeProviders
+	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	if authRouteModel != "" && authRouteModel != normalizedModel {
+		reqMeta[coreexecutor.AuthRouteModelMetadataKey] = authRouteModel
+	}
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -826,7 +849,15 @@ func statusFromError(err error) int {
 	return 0
 }
 
+type requestDetailsOptions struct {
+	allowImageModel bool
+}
+
 func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
+	return h.getRequestDetailsWithOptions(modelName, requestDetailsOptions{})
+}
+
+func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, opts requestDetailsOptions) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
 	resolvedModelName := modelName
 	initialSuffix := thinking.ParseSuffix(modelName)
 	if initialSuffix.ModelName == "auto" {
@@ -843,7 +874,7 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	parsed := thinking.ParseSuffix(resolvedModelName)
 	baseModel := strings.TrimSpace(parsed.ModelName)
 
-	if strings.EqualFold(baseModel, "gpt-image-2") {
+	if strings.EqualFold(baseModel, "gpt-image-2") && !opts.allowImageModel {
 		return nil, "", &interfaces.ErrorMessage{
 			StatusCode: http.StatusServiceUnavailable,
 			Error:      fmt.Errorf("model %s is only supported on /v1/images/generations and /v1/images/edits", baseModel),

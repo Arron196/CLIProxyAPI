@@ -542,6 +542,18 @@ func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string) ([]stri
 	return filterExecutionModels(auth, routeModel, candidates, pooled), pooled
 }
 
+func (m *Manager) preparedExecutionModelsForRequest(auth *Auth, executionModel, routeModel string) ([]string, bool) {
+	executionModel = strings.TrimSpace(executionModel)
+	routeModel = strings.TrimSpace(routeModel)
+	if routeModel == "" || routeModel == executionModel {
+		return m.preparedExecutionModels(auth, executionModel)
+	}
+	if executionModel == "" {
+		return nil, false
+	}
+	return filterExecutionModels(auth, routeModel, []string{executionModel}, false), false
+}
+
 func (m *Manager) prepareExecutionModels(auth *Auth, routeModel string) []string {
 	models, _ := m.preparedExecutionModels(auth, routeModel)
 	return models
@@ -1150,8 +1162,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
-	routeModel := req.Model
-	opts = ensureRequestedModelMetadata(opts, routeModel)
+	routeModel := routeModelFromRequest(req, opts)
+	opts = ensureRequestedModelMetadata(opts, req.Model)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	credentialRetryLimit := effectiveCredentialRetryLimit(maxRetryCredentials)
@@ -1196,7 +1208,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled := m.preparedExecutionModelsForRequest(auth, req.Model, routeModel)
 		if len(models) == 0 {
 			continue
 		}
@@ -1249,8 +1261,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
-	routeModel := req.Model
-	opts = ensureRequestedModelMetadata(opts, routeModel)
+	routeModel := routeModelFromRequest(req, opts)
+	opts = ensureRequestedModelMetadata(opts, req.Model)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	credentialRetryLimit := effectiveCredentialRetryLimit(maxRetryCredentials)
@@ -1295,7 +1307,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled := m.preparedExecutionModelsForRequest(auth, req.Model, routeModel)
 		if len(models) == 0 {
 			continue
 		}
@@ -1348,8 +1360,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	if len(providers) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
-	routeModel := req.Model
-	opts = ensureRequestedModelMetadata(opts, routeModel)
+	routeModel := routeModelFromRequest(req, opts)
+	opts = ensureRequestedModelMetadata(opts, req.Model)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	credentialRetryLimit := effectiveCredentialRetryLimit(maxRetryCredentials)
@@ -1393,7 +1405,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled := m.preparedExecutionModelsForRequest(auth, req.Model, routeModel)
 		if len(models) == 0 {
 			continue
 		}
@@ -1453,6 +1465,31 @@ func hasRequestedModelMetadata(meta map[string]any) bool {
 		return strings.TrimSpace(string(v)) != ""
 	default:
 		return false
+	}
+}
+
+func routeModelFromRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
+	if routeModel := routeModelFromMetadata(opts.Metadata); routeModel != "" {
+		return routeModel
+	}
+	return strings.TrimSpace(req.Model)
+}
+
+func routeModelFromMetadata(meta map[string]any) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	raw, ok := meta[cliproxyexecutor.AuthRouteModelMetadataKey]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []byte:
+		return strings.TrimSpace(string(v))
+	default:
+		return ""
 	}
 }
 

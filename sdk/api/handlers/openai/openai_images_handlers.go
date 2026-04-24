@@ -39,6 +39,13 @@ type sseFrameAccumulator struct {
 	pending []byte
 }
 
+func initialImagesStreamDisconnectError() *interfaces.ErrorMessage {
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadGateway,
+		Error:      fmt.Errorf("stream disconnected before first event"),
+	}
+}
+
 func (a *sseFrameAccumulator) AddChunk(chunk []byte) [][]byte {
 	if len(chunk) == 0 {
 		return nil
@@ -246,10 +253,10 @@ func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 
 	responsesReq := buildImagesResponsesRequest(prompt, nil, tool)
 	if stream {
-		h.streamImagesFromResponses(c, responsesReq, responseFormat, "image_generation")
+		h.streamImagesFromResponses(c, responsesReq, imageModel, responseFormat, "image_generation")
 		return
 	}
-	h.collectImagesFromResponses(c, responsesReq, responseFormat)
+	h.collectImagesFromResponses(c, responsesReq, imageModel, responseFormat)
 }
 
 func (h *OpenAIAPIHandler) ImagesEdits(c *gin.Context) {
@@ -385,10 +392,10 @@ func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
 
 	responsesReq := buildImagesResponsesRequest(prompt, images, tool)
 	if stream {
-		h.streamImagesFromResponses(c, responsesReq, responseFormat, "image_edit")
+		h.streamImagesFromResponses(c, responsesReq, imageModel, responseFormat, "image_edit")
 		return
 	}
-	h.collectImagesFromResponses(c, responsesReq, responseFormat)
+	h.collectImagesFromResponses(c, responsesReq, imageModel, responseFormat)
 }
 
 func (h *OpenAIAPIHandler) imagesEditsFromJSON(c *gin.Context) {
@@ -491,10 +498,10 @@ func (h *OpenAIAPIHandler) imagesEditsFromJSON(c *gin.Context) {
 
 	responsesReq := buildImagesResponsesRequest(prompt, images, tool)
 	if stream {
-		h.streamImagesFromResponses(c, responsesReq, responseFormat, "image_edit")
+		h.streamImagesFromResponses(c, responsesReq, imageModel, responseFormat, "image_edit")
 		return
 	}
-	h.collectImagesFromResponses(c, responsesReq, responseFormat)
+	h.collectImagesFromResponses(c, responsesReq, imageModel, responseFormat)
 }
 
 func buildImagesResponsesRequest(prompt string, images []string, toolJSON []byte) []byte {
@@ -523,13 +530,13 @@ func buildImagesResponsesRequest(prompt string, images []string, toolJSON []byte
 	return req
 }
 
-func (h *OpenAIAPIHandler) collectImagesFromResponses(c *gin.Context, responsesReq []byte, responseFormat string) {
+func (h *OpenAIAPIHandler) collectImagesFromResponses(c *gin.Context, responsesReq []byte, imageModel, responseFormat string) {
 	c.Header("Content-Type", "application/json")
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, "openai-response", defaultImagesMainModel, responsesReq, "")
+	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthRouteModel(cliCtx, "openai-response", defaultImagesMainModel, imageModel, responsesReq, "")
 
 	out, errMsg := collectImagesFromResponsesStream(cliCtx, dataChan, errChan, responseFormat)
 	stopKeepAlive()
@@ -703,7 +710,7 @@ func buildImagesAPIResponse(results []imageCallResult, createdAt int64, usageRaw
 	return out, nil
 }
 
-func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesReq []byte, responseFormat string, streamPrefix string) {
+func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesReq []byte, imageModel, responseFormat string, streamPrefix string) {
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
 		c.JSON(http.StatusInternalServerError, handlers.ErrorResponse{
@@ -716,7 +723,7 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 	}
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, "openai-response", defaultImagesMainModel, responsesReq, "")
+	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthRouteModel(cliCtx, "openai-response", defaultImagesMainModel, imageModel, responsesReq, "")
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
@@ -752,11 +759,9 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
-				setSSEHeaders()
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-				_, _ = c.Writer.Write([]byte("\n"))
-				flusher.Flush()
-				cliCancel(nil)
+				errMsg := initialImagesStreamDisconnectError()
+				h.WriteErrorResponse(c, errMsg)
+				cliCancel(errMsg.Error)
 				return
 			}
 

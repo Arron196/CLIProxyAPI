@@ -132,6 +132,8 @@ type Service struct {
 	maintenanceHookOnce sync.Once
 }
 
+const coreAuthAutoRefreshInterval = 15 * time.Minute
+
 const (
 	defaultMaintenanceScanIntervalSeconds    = 30
 	defaultMaintenanceDeleteIntervalSeconds  = 5
@@ -1808,11 +1810,13 @@ func (s *Service) Run(ctx context.Context) error {
 	var watcherWrapper *WatcherWrapper
 	reloadCallback := func(newCfg *config.Config) {
 		previousRouting := routingSelectorState{strategy: "round-robin"}
+		previousAutoRefreshWorkers := 0
 		previousUsageEnabled := false
 		previousUsagePersistenceInterval := time.Duration(0)
 		s.cfgMu.RLock()
 		if s.cfg != nil {
 			previousRouting = routingStateFromConfig(s.cfg)
+			previousAutoRefreshWorkers = authAutoRefreshWorkersFromConfig(s.cfg)
 			previousUsageEnabled = s.cfg.UsageStatisticsEnabled
 			previousUsagePersistenceInterval = usagePersistenceIntervalForConfig(s.cfg)
 		}
@@ -1828,6 +1832,7 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 
 		nextRouting := routingStateFromConfig(newCfg)
+		restartAutoRefresh := s.coreManager != nil && shouldRestartCoreAutoRefresh(previousAutoRefreshWorkers, authAutoRefreshWorkersFromConfig(newCfg))
 		if s.coreManager != nil && previousRouting != nextRouting {
 			s.coreManager.SetSelector(selectorFromRoutingConfig(newCfg))
 		}
@@ -1843,6 +1848,9 @@ func (s *Service) Run(ctx context.Context) error {
 		if s.coreManager != nil {
 			s.coreManager.SetConfig(newCfg)
 			s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
+			if restartAutoRefresh {
+				s.coreManager.StartAutoRefresh(context.Background(), coreAuthAutoRefreshInterval)
+			}
 		}
 		s.applyUsagePersistenceConfigChange(previousUsageEnabled, previousUsagePersistenceInterval, newCfg)
 		s.rebindExecutors()
@@ -1868,9 +1876,8 @@ func (s *Service) Run(ctx context.Context) error {
 
 	// Prefer core auth manager auto refresh if available.
 	if s.coreManager != nil {
-		interval := 15 * time.Minute
-		s.coreManager.StartAutoRefresh(context.Background(), interval)
-		log.Infof("core auth auto-refresh started (interval=%s)", interval)
+		s.coreManager.StartAutoRefresh(context.Background(), coreAuthAutoRefreshInterval)
+		log.Infof("core auth auto-refresh started (interval=%s)", coreAuthAutoRefreshInterval)
 	}
 	s.startAuthMaintenance(context.Background())
 	s.startUsagePersistenceLoop()
@@ -1882,6 +1889,17 @@ func (s *Service) Run(ctx context.Context) error {
 	case err = <-s.serverErr:
 		return err
 	}
+}
+
+func authAutoRefreshWorkersFromConfig(cfg *config.Config) int {
+	if cfg == nil {
+		return 0
+	}
+	return cfg.AuthAutoRefreshWorkers
+}
+
+func shouldRestartCoreAutoRefresh(previousWorkers, nextWorkers int) bool {
+	return previousWorkers != nextWorkers
 }
 
 // Shutdown gracefully stops background workers and the HTTP server.
