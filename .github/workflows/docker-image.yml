@@ -21,11 +21,23 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
 
       - name: Refresh models catalog
         run: |
+          tmp="$(mktemp)"
           git fetch --depth 1 https://github.com/router-for-me/models.git main
-          git show FETCH_HEAD:models.json > internal/registry/models/models.json
+          git show FETCH_HEAD:models.json > "$tmp"
+          if go run ./cmd/validate_models_catalog -input "$tmp"; then
+            cp "$tmp" internal/registry/models/models.json
+          else
+            echo "::warning title=Models catalog refresh skipped::Fetched models.json failed validation; keeping committed internal/registry/models/models.json"
+          fi
+          rm -f "$tmp"
 
       - name: Prepare image metadata
         id: prep
