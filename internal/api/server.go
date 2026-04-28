@@ -7,8 +7,9 @@ package api
 import (
 	"context"
 	"crypto/subtle"
-	"errors"
+	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -27,6 +28,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -37,6 +39,7 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/net/http2"
 	"gopkg.in/yaml.v3"
 )
 
@@ -124,7 +127,9 @@ type Server struct {
 	engine *gin.Engine
 
 	// server is the underlying HTTP server.
-	server *http.Server
+	server          *http.Server
+	muxBaseListener net.Listener
+	muxHTTPListener *muxListener
 
 	// handlers contains the API handlers for processing requests.
 	handlers *handlers.BaseAPIHandler
@@ -297,6 +302,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// or when a local management password is provided (e.g. TUI mode).
 	hasManagementSecret := cfg.RemoteManagement.SecretKey != "" || envManagementSecret || s.localPassword != ""
 	s.managementRoutesEnabled.Store(hasManagementSecret)
+	redisqueue.SetEnabled(hasManagementSecret)
 	if hasManagementSecret {
 		s.registerManagementRoutes()
 	}
@@ -811,23 +817,61 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to start HTTP server: server not initialized")
 	}
 
+	baseListener, err := net.Listen("tcp", s.server.Addr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s: %v", s.server.Addr, err)
+	}
+	s.muxBaseListener = baseListener
+
+	listener := net.Listener(baseListener)
 	useTLS := s.cfg != nil && s.cfg.TLS.Enable
 	if useTLS {
 		cert := strings.TrimSpace(s.cfg.TLS.Cert)
 		key := strings.TrimSpace(s.cfg.TLS.Key)
 		if cert == "" || key == "" {
+			_ = baseListener.Close()
 			return fmt.Errorf("failed to start HTTPS server: tls.cert or tls.key is empty")
 		}
-		log.Debugf("Starting API server on %s with TLS", s.server.Addr)
-		if errServeTLS := s.server.ListenAndServeTLS(cert, key); errServeTLS != nil && !errors.Is(errServeTLS, http.ErrServerClosed) {
-			return fmt.Errorf("failed to start HTTPS server: %v", errServeTLS)
+		certPair, err := tls.LoadX509KeyPair(cert, key)
+		if err != nil {
+			_ = baseListener.Close()
+			return fmt.Errorf("failed to load TLS certificate: %v", err)
 		}
-		return nil
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{certPair},
+			NextProtos:   []string{"h2", "http/1.1"},
+		}
+		s.server.TLSConfig = tlsConfig
+		if err := http2.ConfigureServer(s.server, &http2.Server{}); err != nil {
+			_ = baseListener.Close()
+			return fmt.Errorf("failed to configure HTTP/2 server: %v", err)
+		}
+		listener = tls.NewListener(baseListener, tlsConfig)
+		log.Debugf("Starting API server on %s with TLS", s.server.Addr)
+	} else {
+		log.Debugf("Starting API server on %s", s.server.Addr)
 	}
 
-	log.Debugf("Starting API server on %s", s.server.Addr)
-	if errServe := s.server.ListenAndServe(); errServe != nil && !errors.Is(errServe, http.ErrServerClosed) {
-		return fmt.Errorf("failed to start HTTP server: %v", errServe)
+	httpListener := newMuxListener(listener.Addr(), 128)
+	s.muxHTTPListener = httpListener
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- normalizeHTTPServeError(s.server.Serve(httpListener))
+	}()
+
+	acceptErr := normalizeListenerError(s.acceptMuxConnections(listener, httpListener))
+	if acceptErr != nil {
+		_ = baseListener.Close()
+		_ = httpListener.Close()
+		_ = s.server.Close()
+		if serveErr := <-serveDone; serveErr != nil {
+			return fmt.Errorf("failed to start API server: accept error: %v; serve error: %v", acceptErr, serveErr)
+		}
+		return fmt.Errorf("failed to accept API server connections: %v", acceptErr)
+	}
+
+	if serveErr := <-serveDone; serveErr != nil {
+		return fmt.Errorf("failed to start API server: %v", serveErr)
 	}
 
 	return nil
@@ -849,6 +893,12 @@ func (s *Server) Stop(ctx context.Context) error {
 		case s.keepAliveStop <- struct{}{}:
 		default:
 		}
+	}
+	if s.muxHTTPListener != nil {
+		_ = s.muxHTTPListener.Close()
+	}
+	if s.muxBaseListener != nil {
+		_ = s.muxBaseListener.Close()
 	}
 
 	// Shutdown the HTTP server.
@@ -975,6 +1025,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 			s.managementRoutesEnabled.Store(!newSecretEmpty)
 		}
 	}
+	redisqueue.SetEnabled(s.managementRoutesEnabled.Load())
 
 	s.applyAccessConfig(oldCfg, cfg)
 	s.cfg = cfg
