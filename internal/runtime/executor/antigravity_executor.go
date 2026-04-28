@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -49,13 +50,21 @@ const (
 	defaultAntigravityAgent        = "antigravity/1.19.6 darwin/arm64"
 	antigravityAuthType            = "antigravity"
 	refreshSkew                    = 3000 * time.Second
+	antigravityCreditsHintInterval = 10 * time.Minute
+	antigravityCreditsHintTimeout  = 5 * time.Second
 	// systemInstruction              = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.**Absolute paths only****Proactiveness**"
 )
 
 var (
-	randSource      = rand.New(rand.NewSource(time.Now().UnixNano()))
-	randSourceMutex sync.Mutex
+	randSource                        = rand.New(rand.NewSource(time.Now().UnixNano()))
+	randSourceMutex                   sync.Mutex
+	antigravityCreditsHintRefreshByID sync.Map
 )
+
+type antigravityCreditsHintRefreshState struct {
+	mu          sync.Mutex
+	lastAttempt time.Time
+}
 
 // AntigravityExecutor proxies requests to the antigravity upstream.
 type AntigravityExecutor struct {
@@ -134,6 +143,61 @@ func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cli
 		client.Transport = cloneTransportWithHTTP11(transport)
 	}
 	return client
+}
+
+func validateAntigravityRequestSignatures(from sdktranslator.Format, rawJSON []byte) ([]byte, error) {
+	if from.String() != "claude" {
+		return rawJSON, nil
+	}
+	rawJSON = antigravityclaude.StripEmptySignatureThinkingBlocks(rawJSON)
+	if cache.SignatureCacheEnabled() {
+		return rawJSON, nil
+	}
+	if !cache.SignatureBypassStrictMode() {
+		return rawJSON, nil
+	}
+	if err := antigravityclaude.ValidateClaudeBypassSignatures(rawJSON); err != nil {
+		return rawJSON, statusErr{code: http.StatusBadRequest, msg: err.Error()}
+	}
+	return rawJSON, nil
+}
+
+func antigravityCreditsRetryEnabled(cfg *config.Config) bool {
+	return cfg != nil && cfg.QuotaExceeded.AntigravityCredits
+}
+
+func antigravityCreditsUseRequested(ctx context.Context, cfg *config.Config) bool {
+	return cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(cfg)
+}
+
+func antigravityHasExplicitCreditsBalanceExhaustedReason(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	details := gjson.GetBytes(body, "error.details")
+	if !details.Exists() || !details.IsArray() {
+		return false
+	}
+	for _, detail := range details.Array() {
+		if detail.Get("@type").String() != "type.googleapis.com/google.rpc.ErrorInfo" {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(detail.Get("reason").String()), "INSUFFICIENT_G1_CREDITS_BALANCE") {
+			return true
+		}
+	}
+	return false
+}
+
+func markAntigravityCreditsHint(auth *cliproxyauth.Auth, available bool) {
+	if auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	cliproxyauth.SetAntigravityCreditsHint(strings.TrimSpace(auth.ID), cliproxyauth.AntigravityCreditsHint{
+		Known:     true,
+		Available: available,
+		UpdatedAt: time.Now(),
+	})
 }
 
 // Identifier returns the executor identifier.
@@ -222,11 +286,11 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
-	if from.String() == "claude" {
-		originalPayloadSource = antigravityclaude.StripInvalidSignatureThinkingBlocks(originalPayloadSource)
-		req.Payload = originalPayloadSource
+	originalPayload, errValidate := validateAntigravityRequestSignatures(from, originalPayloadSource)
+	if errValidate != nil {
+		return resp, errValidate
 	}
-	originalPayload := originalPayloadSource
+	req.Payload = originalPayload
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
 
@@ -286,6 +350,9 @@ attemptLoop:
 			appendAPIResponseChunk(ctx, e.cfg, bodyBytes)
 
 			if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
+				if antigravityCreditsUseRequested(ctx, e.cfg) && httpResp.StatusCode == http.StatusTooManyRequests && antigravityHasExplicitCreditsBalanceExhaustedReason(bodyBytes) {
+					markAntigravityCreditsHint(auth, false)
+				}
 				log.Debugf("antigravity executor: upstream error status: %d, body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), bodyBytes))
 				lastStatus = httpResp.StatusCode
 				lastBody = append([]byte(nil), bodyBytes...)
@@ -318,6 +385,9 @@ attemptLoop:
 				return resp, err
 			}
 
+			if antigravityCreditsUseRequested(ctx, e.cfg) {
+				markAntigravityCreditsHint(auth, true)
+			}
 			reporter.publish(ctx, parseAntigravityUsage(bodyBytes))
 			var param any
 			converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bodyBytes, &param)
@@ -368,11 +438,11 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
-	if from.String() == "claude" {
-		originalPayloadSource = antigravityclaude.StripInvalidSignatureThinkingBlocks(originalPayloadSource)
-		req.Payload = originalPayloadSource
+	originalPayload, errValidate := validateAntigravityRequestSignatures(from, originalPayloadSource)
+	if errValidate != nil {
+		return resp, errValidate
 	}
-	originalPayload := originalPayloadSource
+	req.Payload = originalPayload
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
 
@@ -445,6 +515,9 @@ attemptLoop:
 					return resp, err
 				}
 				appendAPIResponseChunk(ctx, e.cfg, bodyBytes)
+				if antigravityCreditsUseRequested(ctx, e.cfg) && httpResp.StatusCode == http.StatusTooManyRequests && antigravityHasExplicitCreditsBalanceExhaustedReason(bodyBytes) {
+					markAntigravityCreditsHint(auth, false)
+				}
 				lastStatus = httpResp.StatusCode
 				lastBody = append([]byte(nil), bodyBytes...)
 				lastErr = nil
@@ -476,6 +549,9 @@ attemptLoop:
 				return resp, err
 			}
 
+			if antigravityCreditsUseRequested(ctx, e.cfg) {
+				markAntigravityCreditsHint(auth, true)
+			}
 			out := make(chan cliproxyexecutor.StreamChunk)
 			go func(resp *http.Response) {
 				defer close(out)
@@ -764,11 +840,11 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
-	if from.String() == "claude" {
-		originalPayloadSource = antigravityclaude.StripInvalidSignatureThinkingBlocks(originalPayloadSource)
-		req.Payload = originalPayloadSource
+	originalPayload, errValidate := validateAntigravityRequestSignatures(from, originalPayloadSource)
+	if errValidate != nil {
+		return nil, errValidate
 	}
-	originalPayload := originalPayloadSource
+	req.Payload = originalPayload
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
 
@@ -840,6 +916,9 @@ attemptLoop:
 					return nil, err
 				}
 				appendAPIResponseChunk(ctx, e.cfg, bodyBytes)
+				if antigravityCreditsUseRequested(ctx, e.cfg) && httpResp.StatusCode == http.StatusTooManyRequests && antigravityHasExplicitCreditsBalanceExhaustedReason(bodyBytes) {
+					markAntigravityCreditsHint(auth, false)
+				}
 				lastStatus = httpResp.StatusCode
 				lastBody = append([]byte(nil), bodyBytes...)
 				lastErr = nil
@@ -871,6 +950,9 @@ attemptLoop:
 				return nil, err
 			}
 
+			if antigravityCreditsUseRequested(ctx, e.cfg) {
+				markAntigravityCreditsHint(auth, true)
+			}
 			out := make(chan cliproxyexecutor.StreamChunk)
 			go func(resp *http.Response) {
 				defer close(out)
@@ -975,10 +1057,11 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
-	if from.String() == "claude" {
-		originalPayloadSource = antigravityclaude.StripInvalidSignatureThinkingBlocks(originalPayloadSource)
-		req.Payload = originalPayloadSource
+	originalPayload, errValidate := validateAntigravityRequestSignatures(from, originalPayloadSource)
+	if errValidate != nil {
+		return cliproxyexecutor.Response{}, errValidate
 	}
+	req.Payload = originalPayload
 	payload := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
 
 	payload, err := thinking.ApplyThinking(payload, req.Model, from.String(), to.String(), e.Identifier())
@@ -1114,6 +1197,7 @@ func (e *AntigravityExecutor) ensureAccessToken(ctx context.Context, auth *clipr
 	accessToken := metaStringValue(auth.Metadata, "access_token")
 	expiry := tokenExpiry(auth.Metadata)
 	if accessToken != "" && expiry.After(time.Now().Add(refreshSkew)) {
+		e.maybeRefreshAntigravityCreditsHint(ctx, auth, accessToken)
 		return accessToken, nil, nil
 	}
 	refreshCtx := context.Background()
@@ -1204,7 +1288,164 @@ func (e *AntigravityExecutor) refreshToken(ctx context.Context, auth *cliproxyau
 	if errProject := e.ensureAntigravityProjectID(ctx, auth, tokenResp.AccessToken); errProject != nil {
 		log.Warnf("antigravity executor: ensure project id failed: %v", errProject)
 	}
+	if antigravityCreditsRetryEnabled(e.cfg) {
+		e.updateAntigravityCreditsBalance(ctx, auth, tokenResp.AccessToken)
+	}
 	return auth, nil
+}
+
+func (e *AntigravityExecutor) maybeRefreshAntigravityCreditsHint(ctx context.Context, auth *cliproxyauth.Auth, accessToken string) {
+	if e == nil || auth == nil || !antigravityCreditsRetryEnabled(e.cfg) {
+		return
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return
+	}
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" {
+		return
+	}
+	if hint, ok := cliproxyauth.GetAntigravityCreditsHint(authID); ok && hint.Known {
+		return
+	}
+	token := strings.TrimSpace(accessToken)
+	if token == "" {
+		token = metaStringValue(auth.Metadata, "access_token")
+	}
+	if token == "" {
+		return
+	}
+
+	state := &antigravityCreditsHintRefreshState{}
+	if existing, loaded := antigravityCreditsHintRefreshByID.LoadOrStore(authID, state); loaded {
+		if cast, ok := existing.(*antigravityCreditsHintRefreshState); ok && cast != nil {
+			state = cast
+		} else {
+			antigravityCreditsHintRefreshByID.Delete(authID)
+			antigravityCreditsHintRefreshByID.Store(authID, state)
+		}
+	}
+
+	now := time.Now()
+	if !state.mu.TryLock() {
+		return
+	}
+	if !state.lastAttempt.IsZero() && now.Sub(state.lastAttempt) < antigravityCreditsHintInterval {
+		state.mu.Unlock()
+		return
+	}
+	state.lastAttempt = now
+
+	refreshCtx := context.Background()
+	if ctx != nil {
+		if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
+			refreshCtx = context.WithValue(refreshCtx, "cliproxy.roundtripper", rt)
+		}
+	}
+	refreshCtx, cancel := context.WithTimeout(refreshCtx, antigravityCreditsHintTimeout)
+	authCopy := auth.Clone()
+
+	go func() {
+		defer cancel()
+		defer state.mu.Unlock()
+		e.updateAntigravityCreditsBalance(refreshCtx, authCopy, token)
+	}()
+}
+
+func (e *AntigravityExecutor) updateAntigravityCreditsBalance(ctx context.Context, auth *cliproxyauth.Auth, accessToken string) {
+	if e == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	token := strings.TrimSpace(accessToken)
+	if token == "" {
+		token = metaStringValue(auth.Metadata, "access_token")
+	}
+	if token == "" {
+		return
+	}
+
+	userAgent := resolveLoadCodeAssistUserAgent(auth)
+	body, errMarshal := json.Marshal(map[string]any{
+		"metadata": map[string]string{
+			"ide_type":    "ANTIGRAVITY",
+			"ide_version": antigravityVersionFromUserAgent(userAgent),
+			"ide_name":    "antigravity",
+		},
+	})
+	if errMarshal != nil {
+		log.Debugf("antigravity executor: marshal loadCodeAssist request error: %v", errMarshal)
+		return
+	}
+
+	endpointURL := strings.TrimSuffix(buildBaseURL(auth), "/") + "/v1internal:loadCodeAssist"
+	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL, bytes.NewReader(body))
+	if errReq != nil {
+		log.Debugf("antigravity executor: create loadCodeAssist request error: %v", errReq)
+		return
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("User-Agent", userAgent)
+	httpReq.Header.Set("X-Goog-Api-Client", "gl-node/22.21.1")
+
+	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
+	httpResp, errDo := httpClient.Do(httpReq)
+	if errDo != nil {
+		log.Debugf("antigravity executor: loadCodeAssist request error: %v", errDo)
+		return
+	}
+	defer func() {
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("antigravity executor: close loadCodeAssist response body error: %v", errClose)
+		}
+	}()
+
+	bodyBytes, errRead := io.ReadAll(httpResp.Body)
+	if errRead != nil || httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
+		log.Debugf("antigravity executor: loadCodeAssist returned status %d, err=%v", httpResp.StatusCode, errRead)
+		return
+	}
+
+	authID := strings.TrimSpace(auth.ID)
+	paidTierID := strings.TrimSpace(gjson.GetBytes(bodyBytes, "paidTier.id").String())
+	credits := gjson.GetBytes(bodyBytes, "paidTier.availableCredits")
+	if !credits.IsArray() {
+		cliproxyauth.SetAntigravityCreditsHint(authID, cliproxyauth.AntigravityCreditsHint{
+			Known:      true,
+			Available:  false,
+			PaidTierID: paidTierID,
+			UpdatedAt:  time.Now(),
+		})
+		return
+	}
+	for _, credit := range credits.Array() {
+		if !strings.EqualFold(credit.Get("creditType").String(), "GOOGLE_ONE_AI") {
+			continue
+		}
+		creditAmount, errCA := strconv.ParseFloat(strings.TrimSpace(credit.Get("creditAmount").String()), 64)
+		if errCA != nil {
+			continue
+		}
+		minAmount, errMA := strconv.ParseFloat(strings.TrimSpace(credit.Get("minimumCreditAmountForUsage").String()), 64)
+		if errMA != nil {
+			continue
+		}
+		cliproxyauth.SetAntigravityCreditsHint(authID, cliproxyauth.AntigravityCreditsHint{
+			Known:           true,
+			Available:       creditAmount >= minAmount,
+			CreditAmount:    creditAmount,
+			MinCreditAmount: minAmount,
+			PaidTierID:      paidTierID,
+			UpdatedAt:       time.Now(),
+		})
+		return
+	}
+	cliproxyauth.SetAntigravityCreditsHint(authID, cliproxyauth.AntigravityCreditsHint{
+		Known:      true,
+		Available:  false,
+		PaidTierID: paidTierID,
+		UpdatedAt:  time.Now(),
+	})
 }
 
 func (e *AntigravityExecutor) ensureAntigravityProjectID(ctx context.Context, auth *cliproxyauth.Auth, accessToken string) error {
@@ -1284,6 +1525,11 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		}
 	}
 	payload, _ = sjson.SetBytes(payload, "model", modelName)
+	if e != nil && antigravityCreditsUseRequested(ctx, e.cfg) {
+		if updated := injectEnabledCreditTypes(payload); len(updated) > 0 {
+			payload = updated
+		}
+	}
 
 	useAntigravitySchema := strings.Contains(modelName, "claude") || strings.Contains(modelName, "gemini-3-pro") || strings.Contains(modelName, "gemini-3.1-pro")
 	var (
@@ -1371,6 +1617,17 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 	})
 
 	return httpReq, nil
+}
+
+func injectEnabledCreditTypes(payload []byte) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return nil
+	}
+	updated, err := sjson.SetRawBytes(payload, "enabledCreditTypes", []byte(`["GOOGLE_ONE_AI"]`))
+	if err != nil {
+		return nil
+	}
+	return updated
 }
 
 func antigravityRequestNeedsSchemaSanitization(payload []byte) bool {
@@ -1476,6 +1733,21 @@ func resolveUserAgent(auth *cliproxyauth.Auth) string {
 		}
 	}
 	return defaultAntigravityAgent
+}
+
+func resolveLoadCodeAssistUserAgent(auth *cliproxyauth.Auth) string {
+	return resolveUserAgent(auth)
+}
+
+func antigravityVersionFromUserAgent(userAgent string) string {
+	userAgent = strings.TrimSpace(userAgent)
+	for _, field := range strings.Fields(userAgent) {
+		version, ok := strings.CutPrefix(field, "antigravity/")
+		if ok {
+			return strings.TrimSpace(version)
+		}
+	}
+	return ""
 }
 
 func antigravityRetryAttempts(auth *cliproxyauth.Auth, cfg *config.Config) int {

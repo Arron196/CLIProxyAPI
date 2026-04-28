@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -47,9 +48,26 @@ func (h *GeminiCLIAPIHandler) Models() []map[string]any {
 }
 
 // CLIHandler handles CLI-specific requests for Gemini API operations.
-// Access control is enforced at the router level so authenticated clients can
-// use Gemini CLI-compatible routes through the public proxy.
 func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
+	if h.Cfg == nil || !h.Cfg.EnableGeminiCLIEndpoint {
+		c.JSON(http.StatusForbidden, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: "Gemini CLI endpoint is disabled",
+				Type:    "forbidden",
+			},
+		})
+		return
+	}
+	if !isLocalGeminiCLIRequest(c.Request) {
+		c.JSON(http.StatusForbidden, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: "CLI reply only allow local access",
+				Type:    "forbidden",
+			},
+		})
+		return
+	}
+
 	rawJSON, _ := c.GetRawData()
 	requestRawURI := c.Request.URL.Path
 
@@ -69,8 +87,9 @@ func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
 			})
 			return
 		}
-		req.Header = handlers.FilterUpstreamHeaders(c.Request.Header)
-		stripConsumedProxyCredential(req, c)
+		for key, value := range handlers.FilterUpstreamHeaders(c.Request.Header) {
+			req.Header[key] = append([]string(nil), value...)
+		}
 
 		httpClient := util.SetProxy(h.Cfg, &http.Client{})
 
@@ -106,9 +125,7 @@ func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
 			_ = resp.Body.Close()
 		}()
 
-		for key, value := range resp.Header {
-			c.Header(key, value[0])
-		}
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), resp.Header)
 		output, err := io.ReadAll(resp.Body)
 		if err != nil {
 			log.Errorf("Failed to read response body: %v", err)
@@ -118,6 +135,31 @@ func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
 		_, _ = c.Writer.Write(output)
 		c.Set("API_RESPONSE", output)
 	}
+}
+
+func isLocalGeminiCLIRequest(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	remoteHost, _, err := net.SplitHostPort(req.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	remoteIP := net.ParseIP(strings.Trim(remoteHost, "[]"))
+	if remoteIP == nil || !remoteIP.IsLoopback() {
+		return false
+	}
+
+	requestHost := strings.TrimSpace(req.Host)
+	if host, _, err := net.SplitHostPort(requestHost); err == nil {
+		requestHost = host
+	}
+	requestHost = strings.Trim(strings.ToLower(strings.TrimSpace(requestHost)), "[]")
+	if requestHost == "localhost" {
+		return true
+	}
+	hostIP := net.ParseIP(requestHost)
+	return hostIP != nil && hostIP.IsLoopback()
 }
 
 func stripConsumedProxyCredential(req *http.Request, c *gin.Context) {
@@ -242,7 +284,8 @@ func (h *GeminiCLIAPIHandler) handleInternalGenerateContent(c *gin.Context, rawJ
 func (h *GeminiCLIAPIHandler) forwardCLIStream(c *gin.Context, flusher http.Flusher, alt string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
 	var keepAliveInterval *time.Duration
 	if alt != "" {
-		keepAliveInterval = new(time.Duration(0))
+		zero := time.Duration(0)
+		keepAliveInterval = &zero
 	}
 
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{

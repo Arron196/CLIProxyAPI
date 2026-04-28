@@ -1565,6 +1565,23 @@ func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName 
 	return "", "", false
 }
 
+func (s *Service) openAICompatDisabled(compatName string) bool {
+	if s == nil || s.cfg == nil {
+		return false
+	}
+	compatName = strings.TrimSpace(compatName)
+	if compatName == "" {
+		return false
+	}
+	for i := range s.cfg.OpenAICompatibility {
+		compat := &s.cfg.OpenAICompatibility[i]
+		if strings.EqualFold(compat.Name, compatName) {
+			return compat.Disabled
+		}
+	}
+	return false
+}
+
 func (s *Service) ensureExecutorsForAuth(a *coreauth.Auth) {
 	s.ensureExecutorsForAuthWithMode(a, false)
 }
@@ -1592,7 +1609,10 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 	if a.Disabled {
 		return
 	}
-	if compatProviderKey, _, isCompat := openAICompatInfoFromAuth(a); isCompat {
+	if compatProviderKey, compatName, isCompat := openAICompatInfoFromAuth(a); isCompat {
+		if s.openAICompatDisabled(compatName) {
+			return
+		}
 		if compatProviderKey == "" {
 			compatProviderKey = strings.ToLower(strings.TrimSpace(a.Provider))
 		}
@@ -2163,6 +2183,10 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 				compat := &s.cfg.OpenAICompatibility[i]
 				if strings.EqualFold(compat.Name, compatName) {
 					isCompatAuth = true
+					if compat.Disabled {
+						GlobalModelRegistry().UnregisterClient(a.ID)
+						return
+					}
 					// Convert compatibility models to registry models
 					ms := make([]*ModelInfo, 0, len(compat.Models))
 					for j := range compat.Models {

@@ -56,3 +56,22 @@ func TestOpenAICompatExecutorCompactPassthrough(t *testing.T) {
 		t.Fatalf("payload = %s", string(resp.Payload))
 	}
 }
+
+func TestOpenAICompatExecutorResolveCompatConfigSkipsDisabled(t *testing.T) {
+	executor := NewOpenAICompatExecutor("disabled", &config.Config{
+		OpenAICompatibility: []config.OpenAICompatibility{
+			{Name: "disabled", Disabled: true},
+		},
+	})
+	auth := &cliproxyauth.Auth{
+		Provider: "disabled",
+		Attributes: map[string]string{
+			"compat_name":  "disabled",
+			"provider_key": "disabled",
+		},
+	}
+
+	if got := executor.resolveCompatConfig(auth); got != nil {
+		t.Fatalf("resolveCompatConfig returned disabled config: %+v", got)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"io"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
@@ -72,6 +73,28 @@ func TestAntigravityBuildRequest_CapsMaxOutputTokensToRegistryLimit(t *testing.T
 
 	if got := gjson.GetBytes(raw, "request.generationConfig.maxOutputTokens").Int(); got != 64000 {
 		t.Fatalf("request.generationConfig.maxOutputTokens = %d, want %d", got, 64000)
+	}
+}
+
+func TestAntigravityBuildRequest_CreditsContextInjectsEnabledCreditTypes(t *testing.T) {
+	executor := &AntigravityExecutor{cfg: &config.Config{
+		QuotaExceeded: config.QuotaExceeded{AntigravityCredits: true},
+	}}
+	auth := &cliproxyauth.Auth{}
+	payload := []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}}`)
+
+	req, err := executor.buildRequest(cliproxyauth.WithAntigravityCredits(context.Background()), auth, "token", "claude-opus-4-6", payload, false, "", "https://example.com")
+	if err != nil {
+		t.Fatalf("buildRequest error: %v", err)
+	}
+
+	raw, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read request body error: %v", err)
+	}
+
+	if got := gjson.GetBytes(raw, "enabledCreditTypes.0").String(); got != "GOOGLE_ONE_AI" {
+		t.Fatalf("enabledCreditTypes.0 = %q, want GOOGLE_ONE_AI; body=%s", got, string(raw))
 	}
 }
 

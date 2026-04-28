@@ -168,42 +168,46 @@ func TestAmpProviderModelRoutes(t *testing.T) {
 	}
 }
 
-func TestGeminiCLIRouteRequiresAPIKey(t *testing.T) {
+func TestGeminiCLIRouteDisabledByDefault(t *testing.T) {
 	server := newTestServer(t)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1internal:generateContent", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1internal:generateContent", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "127.0.0.1:4567"
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusForbidden, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "Gemini CLI endpoint is disabled") {
+		t.Fatalf("body = %q, want disabled endpoint error", rr.Body.String())
+	}
+}
+
+func TestGeminiCLIRouteRejectsNonLocalWhenEnabled(t *testing.T) {
+	server := newTestServer(t)
+	server.cfg.EnableGeminiCLIEndpoint = true
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1internal:generateContent", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.RemoteAddr = "203.0.113.7:4567"
 
 	rr := httptest.NewRecorder()
 	server.engine.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusUnauthorized, rr.Body.String())
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusForbidden, rr.Body.String())
 	}
-	if !strings.Contains(rr.Body.String(), "Missing API key") {
-		t.Fatalf("body = %q, want missing API key error", rr.Body.String())
-	}
-}
-
-func TestGeminiCLIRouteAllowsAuthenticatedNonLocalRequest(t *testing.T) {
-	server := newTestServer(t)
-
-	req := httptest.NewRequest(http.MethodPost, "/v1internal:generateContent", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer test-key")
-	req.RemoteAddr = "203.0.113.7:4567"
-
-	rr := httptest.NewRecorder()
-	server.engine.ServeHTTP(rr, req)
-
-	if rr.Code == http.StatusUnauthorized || rr.Code == http.StatusForbidden {
-		t.Fatalf("status = %d, want request to pass auth and localhost gate; body=%s", rr.Code, rr.Body.String())
+	if !strings.Contains(rr.Body.String(), "CLI reply only allow local access") {
+		t.Fatalf("body = %q, want local access error", rr.Body.String())
 	}
 }
 
-func TestGeminiCLIPassthroughStripsAuthorizationUsedForProxyAuth(t *testing.T) {
+func TestGeminiCLIPassthroughPreservesAuthorizationForLocalEndpoint(t *testing.T) {
 	server := newTestServer(t)
+	server.cfg.EnableGeminiCLIEndpoint = true
 
 	var upstreamAuthorization string
 	stubDefaultTransport(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
@@ -216,9 +220,10 @@ func TestGeminiCLIPassthroughStripsAuthorizationUsedForProxyAuth(t *testing.T) {
 		}, nil
 	}))
 
-	req := httptest.NewRequest(http.MethodPost, "/v1internal:countTokens", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1internal:countTokens", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Authorization", "Bearer upstream-token")
+	req.RemoteAddr = "127.0.0.1:4567"
 
 	rr := httptest.NewRecorder()
 	server.engine.ServeHTTP(rr, req)
@@ -226,13 +231,91 @@ func TestGeminiCLIPassthroughStripsAuthorizationUsedForProxyAuth(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
 	}
-	if upstreamAuthorization != "" {
-		t.Fatalf("upstream Authorization = %q, want empty", upstreamAuthorization)
+	if upstreamAuthorization != "Bearer upstream-token" {
+		t.Fatalf("upstream Authorization = %q, want %q", upstreamAuthorization, "Bearer upstream-token")
 	}
 }
 
-func TestGeminiCLIPassthroughPreservesUpstreamAuthorizationWhenProxyAuthUsesGoogleAPIKey(t *testing.T) {
+func TestGeminiCLIRouteAllowsLoopbackHostForms(t *testing.T) {
+	tests := []struct {
+		name       string
+		targetURL  string
+		remoteAddr string
+	}{
+		{name: "localhost host", targetURL: "http://localhost/v1internal:countTokens", remoteAddr: "127.0.0.1:4567"},
+		{name: "localhost with port", targetURL: "http://localhost:8080/v1internal:countTokens", remoteAddr: "127.0.0.1:4567"},
+		{name: "ipv6 loopback", targetURL: "http://[::1]:8080/v1internal:countTokens", remoteAddr: "[::1]:4567"},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			server := newTestServer(t)
+			server.cfg.EnableGeminiCLIEndpoint = true
+
+			stubDefaultTransport(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"status":"ok"}`)),
+					Request:    req,
+				}, nil
+			}))
+
+			req := httptest.NewRequest(http.MethodPost, tc.targetURL, bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
+			req.Header.Set("Content-Type", "application/json")
+			req.RemoteAddr = tc.remoteAddr
+
+			rr := httptest.NewRecorder()
+			server.engine.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestGeminiCLIPassthroughFiltersHopByHopHeaders(t *testing.T) {
 	server := newTestServer(t)
+	server.cfg.EnableGeminiCLIEndpoint = true
+
+	var upstreamHeaders http.Header
+	stubDefaultTransport(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		upstreamHeaders = req.Header.Clone()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"status":"ok"}`)),
+			Request:    req,
+		}, nil
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1internal:countTokens", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer upstream-token")
+	req.Header.Set("Connection", "keep-alive, X-Hop")
+	req.Header.Set("X-Hop", "drop-me")
+	req.Header.Set("Transfer-Encoding", "chunked")
+	req.RemoteAddr = "127.0.0.1:4567"
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if upstreamHeaders.Get("Authorization") != "Bearer upstream-token" {
+		t.Fatalf("Authorization = %q, want preserved upstream token", upstreamHeaders.Get("Authorization"))
+	}
+	if upstreamHeaders.Get("Connection") != "" || upstreamHeaders.Get("Transfer-Encoding") != "" || upstreamHeaders.Get("X-Hop") != "" {
+		t.Fatalf("hop-by-hop headers leaked upstream: %v", upstreamHeaders)
+	}
+}
+
+func TestGeminiCLIPassthroughPreservesGoogleAPIKeyForLocalEndpoint(t *testing.T) {
+	server := newTestServer(t)
+	server.cfg.EnableGeminiCLIEndpoint = true
 
 	var (
 		upstreamAuthorization string
@@ -249,10 +332,11 @@ func TestGeminiCLIPassthroughPreservesUpstreamAuthorizationWhenProxyAuthUsesGoog
 		}, nil
 	}))
 
-	req := httptest.NewRequest(http.MethodPost, "/v1internal:countTokens", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1internal:countTokens", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Goog-Api-Key", "test-key")
+	req.Header.Set("X-Goog-Api-Key", "upstream-key")
 	req.Header.Set("Authorization", "Bearer upstream-token")
+	req.RemoteAddr = "127.0.0.1:4567"
 
 	rr := httptest.NewRecorder()
 	server.engine.ServeHTTP(rr, req)
@@ -263,8 +347,8 @@ func TestGeminiCLIPassthroughPreservesUpstreamAuthorizationWhenProxyAuthUsesGoog
 	if upstreamAuthorization != "Bearer upstream-token" {
 		t.Fatalf("upstream Authorization = %q, want %q", upstreamAuthorization, "Bearer upstream-token")
 	}
-	if upstreamGoogleAPIKey != "" {
-		t.Fatalf("upstream X-Goog-Api-Key = %q, want empty", upstreamGoogleAPIKey)
+	if upstreamGoogleAPIKey != "upstream-key" {
+		t.Fatalf("upstream X-Goog-Api-Key = %q, want %q", upstreamGoogleAPIKey, "upstream-key")
 	}
 }
 

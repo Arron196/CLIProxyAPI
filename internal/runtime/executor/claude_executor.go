@@ -187,6 +187,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if isClaudeOAuthToken(apiKey) {
 		bodyForUpstream = remapOAuthToolNames(bodyForUpstream)
 	}
+	if isClaudeOAuthToken(apiKey) || experimentalCCHSigningEnabled(e.cfg, auth) {
+		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
+	}
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
@@ -355,6 +358,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	if isClaudeOAuthToken(apiKey) {
 		bodyForUpstream = remapOAuthToolNames(bodyForUpstream)
+	}
+	if isClaudeOAuthToken(apiKey) || experimentalCCHSigningEnabled(e.cfg, auth) {
+		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
@@ -1328,31 +1334,11 @@ func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (string, bool, []string, bo
 
 // resolveClaudeKeyCloakConfig finds the matching ClaudeKey config and returns its CloakConfig.
 func resolveClaudeKeyCloakConfig(cfg *config.Config, auth *cliproxyauth.Auth) *config.CloakConfig {
-	if cfg == nil || auth == nil {
+	entry := resolveClaudeKeyConfig(cfg, auth)
+	if entry == nil {
 		return nil
 	}
-
-	apiKey, baseURL := claudeCreds(auth)
-	if apiKey == "" {
-		return nil
-	}
-
-	for i := range cfg.ClaudeKey {
-		entry := &cfg.ClaudeKey[i]
-		cfgKey := strings.TrimSpace(entry.APIKey)
-		cfgBase := strings.TrimSpace(entry.BaseURL)
-
-		// Match by API key
-		if strings.EqualFold(cfgKey, apiKey) {
-			// If baseURL is specified, also check it
-			if baseURL != "" && cfgBase != "" && !strings.EqualFold(cfgBase, baseURL) {
-				continue
-			}
-			return entry.Cloak
-		}
-	}
-
-	return nil
+	return entry.Cloak
 }
 
 // injectFakeUserID generates and injects a fake user ID into the request metadata.

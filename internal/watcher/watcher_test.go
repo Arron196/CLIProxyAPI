@@ -70,6 +70,7 @@ func TestBuildAPIKeyClientsCounts(t *testing.T) {
 		CodexKey:  []config.CodexKey{{APIKey: "x1"}, {APIKey: "x2"}},
 		OpenAICompatibility: []config.OpenAICompatibility{
 			{APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "o1"}, {APIKey: "o2"}}},
+			{Disabled: true, APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "disabled"}}},
 		},
 	}
 
