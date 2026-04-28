@@ -15,6 +15,7 @@ type Record struct {
 	APIKey      string
 	AuthID      string
 	AuthIndex   string
+	AuthType    string
 	Source      string
 	RequestedAt time.Time
 	Latency     time.Duration
@@ -43,6 +44,7 @@ type queueItem struct {
 
 // Manager maintains a queue of usage records and delivers them to registered plugins.
 type Manager struct {
+	buffer   int
 	once     sync.Once
 	stopOnce sync.Once
 	cancel   context.CancelFunc
@@ -58,7 +60,11 @@ type Manager struct {
 
 // NewManager constructs a manager with a buffered queue.
 func NewManager(buffer int) *Manager {
+	if buffer <= 0 {
+		buffer = 512
+	}
 	m := &Manager{}
+	m.buffer = buffer
 	m.cond = sync.NewCond(&m.mu)
 	return m
 }
@@ -117,12 +123,30 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 		m.mu.Unlock()
 		return
 	}
+	if m.buffer > 0 && len(m.queue) >= m.buffer {
+		copy(m.queue, m.queue[1:])
+		m.queue[len(m.queue)-1] = queueItem{}
+		m.queue = m.queue[:len(m.queue)-1]
+	}
 	m.queue = append(m.queue, queueItem{ctx: ctx, record: record})
 	m.mu.Unlock()
 	m.cond.Signal()
 }
 
 func (m *Manager) run(ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			m.mu.Lock()
+			m.closed = true
+			m.mu.Unlock()
+			m.cond.Broadcast()
+		case <-done:
+		}
+	}()
+	defer close(done)
+
 	for {
 		m.mu.Lock()
 		for !m.closed && len(m.queue) == 0 {

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
@@ -46,6 +47,32 @@ func TestParseOpenAIUsageResponses(t *testing.T) {
 	}
 	if detail.ReasoningTokens != 9 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 9)
+	}
+}
+
+func TestParseOpenAIStreamUsageResponsesAliases(t *testing.T) {
+	line := []byte(`data: {"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":7},"output_tokens_details":{"reasoning_tokens":9}}}`)
+	detail, ok := parseOpenAIStreamUsage(line)
+	if !ok {
+		t.Fatal("parseOpenAIStreamUsage ok = false, want true")
+	}
+	if detail.InputTokens != 10 || detail.OutputTokens != 20 || detail.TotalTokens != 30 {
+		t.Fatalf("token counts = input %d output %d total %d", detail.InputTokens, detail.OutputTokens, detail.TotalTokens)
+	}
+	if detail.CachedTokens != 7 || detail.ReasoningTokens != 9 {
+		t.Fatalf("token details = cached %d reasoning %d", detail.CachedTokens, detail.ReasoningTokens)
+	}
+}
+
+func TestUsageReporterBuildRecordIncludesAuthType(t *testing.T) {
+	reporter := newUsageReporter(context.Background(), "gemini-cli", "gemini-2.5-pro", &cliproxyauth.Auth{
+		ID:       "auth-id",
+		Provider: "gemini-cli",
+		Metadata: map[string]any{"email": "user@example.com"},
+	})
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 1}, false)
+	if record.AuthType != "oauth" {
+		t.Fatalf("AuthType = %q, want oauth", record.AuthType)
 	}
 }
 
