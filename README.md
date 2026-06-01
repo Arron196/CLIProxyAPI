@@ -1,3 +1,6 @@
+# 项目目前停止更新
+由于最开始是针对大规模的free号调度进行的优化，而现在这方面的需求已经逐渐减少了，为了最快适应官方改动，建议大家使用官方的CliproxyAPI即可
+
 # CLIProxyAPI Fork
 
 This repository is an independent fork of
